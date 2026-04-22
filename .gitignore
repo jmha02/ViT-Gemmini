@@ -1,0 +1,12 @@
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.a
+*.o
+*.log
+*.onnx
+*.tar
+*.pth
+*.pth.tar
