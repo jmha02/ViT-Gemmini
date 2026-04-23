@@ -1824,6 +1824,58 @@ def _build_deit_layer_ranges(call_names):
         block_starts.append(idx + 1)
 
     if not block_starts:
+        # Some recent I-ViT TVM builds fuse the layernorm prelude into generic
+        # fixed-point kernels, so the original layernorm-sequence matcher stops
+        # seeing clear block starts. In that case, the exported operator order
+        # still follows a stable pattern:
+        #   patch_embed (2 calls) + depth * 24 block calls + head (optional 3 calls)
+        # Use that regularity as a fallback so semantic profiling keeps working.
+        expected_depth = MODEL_SPECS["deit_tiny_patch16_224"]["depth"]
+        block_span = 24
+        head_size = 0
+        if (
+            len(call_names) >= 3
+            and call_names[-3].startswith("tvmgen_default_fused_cast_sum")
+            and _is_gemm_kernel(call_names[-2])
+            and _is_gemm_kernel(call_names[-1])
+        ):
+            head_size = 3
+        prefix_calls = len(call_names) - expected_depth * block_span - head_size
+        # Only trust this fallback when the unmatched prefix is tiny. If the
+        # generated call trace is much longer than the operator-function order
+        # (for example because helper/runtime calls are mixed in), this
+        # heuristic would smear huge ranges over patch_embed and must not fire.
+        if 0 <= prefix_calls <= 8:
+            block_starts = [
+                prefix_calls + 1 + block_idx * block_span
+                for block_idx in range(expected_depth)
+            ]
+            head_start = (
+                prefix_calls + expected_depth * block_span + 1 if head_size else None
+            )
+            ranges = []
+            if prefix_calls > 0:
+                ranges.append(
+                    {"layer": "patch_embed", "start_call": 1, "end_call": prefix_calls}
+                )
+            for block_idx, start_call in enumerate(block_starts):
+                end_call = (
+                    block_starts[block_idx + 1] - 1
+                    if block_idx + 1 < len(block_starts)
+                    else (head_start - 1 if head_start is not None else len(call_names))
+                )
+                ranges.append(
+                    {
+                        "layer": f"block_{block_idx}",
+                        "start_call": start_call,
+                        "end_call": end_call,
+                    }
+                )
+            if head_start is not None:
+                ranges.append(
+                    {"layer": "head", "start_call": head_start, "end_call": len(call_names)}
+                )
+            return ranges
         raise RuntimeError(
             f"Expected at least one DeiT block start, found {len(block_starts)}: {block_starts}"
         )

@@ -76,7 +76,10 @@ Notes:
   during validation.
 - `RepQ DeiT` ORT export currently produces a semantic ONNX graph that still runs
   on Spike with the Gemmini-enabled ORT runner, but it is not lowered to the same
-  custom-op style as the I-ViT ORT path.
+  custom-op style as the I-ViT ORT path unless `--lower-qlinear-matmul` is enabled.
+- For fair TVM vs ORT performance comparison on RepQ, use
+  `--repq-gemmini-kernel-mode approx`. That matches the TVM Gemmini path more
+  closely. `exact` remains available for fidelity/debug comparisons.
 
 ## Manual Commands
 
@@ -110,6 +113,8 @@ python3 ONNXRuntime/export/repq/export_repq_onnx.py \
   --allow-random-init \
   --allow-random-calibration \
   --device cpu \
+  --lower-qlinear-matmul \
+  --repq-gemmini-kernel-mode approx \
   --output build/ort/repq_deit_tiny_w8a8_lowered.onnx
 ```
 

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 source "${REPO_ROOT}/env.sh" >/dev/null
+export PYTHONUNBUFFERED=1
 
 BUILD_DIR="${REPO_ROOT}/build"
 CKPT_DIR="${BUILD_DIR}/checkpoints"
@@ -51,6 +52,8 @@ python3 "${REPO_ROOT}/ONNXRuntime/export/repq/export_repq_onnx.py" \
     --calib-num-samples 8 \
     --w-bits 8 \
     --a-bits 8 \
+    --lower-qlinear-matmul \
+    --repq-gemmini-kernel-mode approx \
     --output "${ORT_DIR}/repq_deit_tiny_w8a8_lowered.onnx"
 
 "${REPO_ROOT}/ONNXRuntime/run/run_ort_spike.sh" \

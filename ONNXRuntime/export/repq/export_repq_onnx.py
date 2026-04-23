@@ -202,6 +202,12 @@ def parse_args() -> argparse.Namespace:
         help="Rewrite eligible RepQ MatMul/Gemm nodes into QLinearMatMul + dequantize form",
     )
     parser.add_argument(
+        "--repq-gemmini-kernel-mode",
+        choices=("approx", "exact"),
+        default="approx",
+        help="Kernel mode used for lowered RepQ custom matmul ops",
+    )
+    parser.add_argument(
         "--export-batch-size",
         default=1,
         type=int,
@@ -488,6 +494,7 @@ def lower_qlinear_matmul_nodes(
     output_path: Path,
     lowering_stats: dict[str, dict[str, float | int]],
     n_bits: int = 8,
+    repq_gemmini_kernel_mode: str = "approx",
 ) -> dict[str, int]:
     import onnx
     from onnx import helper, numpy_helper
@@ -507,6 +514,7 @@ def lower_qlinear_matmul_nodes(
                     break
 
     name_counter: dict[str, int] = {}
+    profile_node_index = 0
 
     def unique_name(prefix: str) -> str:
         count = name_counter.get(prefix, 0)
@@ -515,6 +523,16 @@ def lower_qlinear_matmul_nodes(
 
     def sanitize(prefix: str) -> str:
         return prefix.replace("/", "_").replace(".", "_").replace(":", "_")
+
+    def make_profile_attrs(raw_name: str) -> dict[str, object]:
+        nonlocal profile_node_index
+        label = sanitize(raw_name).lstrip("_") or "unnamed"
+        attrs = {
+            "profile_label": label,
+            "profile_node_index": int(profile_node_index),
+        }
+        profile_node_index += 1
+        return attrs
 
     def get_attr(node, attr_name: str, default=None):
         for attr in node.attribute:
@@ -591,6 +609,22 @@ def lower_qlinear_matmul_nodes(
     def quantize_int8(values: np.ndarray, scale: float) -> np.ndarray:
         quantized = np.rint(values.astype(np.float32) / np.float32(scale))
         return np.clip(quantized, -127, 127).astype(np.int8)
+
+    def sym_scale_from_uniform_params(scale_name: str, zero_point_name: str) -> float:
+        scales = get_const(scale_name).astype(np.float32).reshape(-1)
+        zero_points = get_const(zero_point_name).astype(np.float32).reshape(-1)
+        levels = float((1 << int(n_bits)) - 1)
+        qmin = -zero_points
+        qmax = levels - zero_points
+        max_abs = max(
+            float(np.max(np.abs(qmin * scales))),
+            float(np.max(np.abs(qmax * scales))),
+        )
+        return max(max_abs / 127.0, 1e-8)
+
+    def sym_scale_from_log_delta(delta_name: str) -> float:
+        delta = float(np.asarray(get_const(delta_name), dtype=np.float32).reshape(-1)[0])
+        return max(abs(delta) / 127.0, 1e-8)
 
     def parse_weight_input(tensor_name: str, force_transpose: bool = False):
         transpose_node = producer.get(tensor_name)
@@ -676,6 +710,78 @@ def lower_qlinear_matmul_nodes(
             normalized.append(part)
         return ".".join(normalized)
 
+    def append_approx_gemmini_matmul(
+        *,
+        a_source: str,
+        a_sym_scale: float,
+        b_source: str | None,
+        b_sym_scale: float,
+        out_names: list[str],
+        prefix: str,
+        raw_name: str,
+        b_const_int8: np.ndarray | None = None,
+    ) -> None:
+        profile_attrs = make_profile_attrs(raw_name)
+        zero_point_name = add_initializer(f"{prefix}_sym_zp", scalar_i8(0))
+        a_scale_name = add_initializer(f"{prefix}_a_sym_scale", scalar_f32(a_sym_scale))
+        a_quant_name = unique_name(f"{prefix}_a_quant")
+        rewritten.append(
+            helper.make_node(
+                "QuantizeLinear",
+                [a_source, a_scale_name, zero_point_name],
+                [a_quant_name],
+                name=unique_name(f"{prefix}_AQuantizeLinear"),
+            )
+        )
+
+        if b_const_int8 is None:
+            if b_source is None:
+                raise RuntimeError("Approx Gemmini matmul requires either b_source or b_const_int8")
+            b_scale_name = add_initializer(f"{prefix}_b_sym_scale", scalar_f32(b_sym_scale))
+            b_quant_name = unique_name(f"{prefix}_b_quant")
+            rewritten.append(
+                helper.make_node(
+                    "QuantizeLinear",
+                    [b_source, b_scale_name, zero_point_name],
+                    [b_quant_name],
+                    name=unique_name(f"{prefix}_BQuantizeLinear"),
+                )
+            )
+        else:
+            b_quant_name = add_initializer(f"{prefix}_b_sym_data", b_const_int8.astype(np.int8))
+
+        matmul_output = unique_name(f"{prefix}_gemmini_mm")
+        rewritten.append(
+            helper.make_node(
+                "GemminiMatMulInteger",
+                [a_quant_name, b_quant_name, zero_point_name, zero_point_name],
+                [matmul_output],
+                domain="ivit",
+                name=unique_name(f"{prefix}_GemminiMatMulInteger"),
+                **profile_attrs,
+            )
+        )
+
+        cast_output = unique_name(f"{prefix}_gemmini_mm_f32")
+        rewritten.append(
+            helper.make_node(
+                "Cast",
+                [matmul_output],
+                [cast_output],
+                name=unique_name(f"{prefix}_CastFloat"),
+                to=onnx.TensorProto.FLOAT,
+            )
+        )
+        mm_scale_name = add_initializer(f"{prefix}_gemmini_mm_scale", scalar_f32(a_sym_scale * b_sym_scale))
+        rewritten.append(
+            helper.make_node(
+                "Mul",
+                [cast_output, mm_scale_name],
+                list(out_names),
+                name=unique_name(f"{prefix}_DequantMul"),
+            )
+        )
+
     rewritten: list = []
     replace_output: dict[str, str] = {}
     lowered_counts = {
@@ -683,6 +789,7 @@ def lower_qlinear_matmul_nodes(
         "repq_uniform_matmul": 0,
         "repq_log_matmul": 0,
     }
+    approximate_attr = 1 if repq_gemmini_kernel_mode == "approx" else 0
 
     for node in model.graph.node:
         original_inputs = list(node.input)
@@ -696,6 +803,26 @@ def lower_qlinear_matmul_nodes(
             if repq_node is not None and repq_node.op_type == "RepQLogQuant":
                 b_info = parse_uniform_dequant(original_inputs[1])
                 if b_info is not None:
+                    if repq_gemmini_kernel_mode == "approx":
+                        try:
+                            attn_sym_scale = sym_scale_from_log_delta(repq_node.input[1])
+                            value_sym_scale = sym_scale_from_uniform_params(b_info["scale"], b_info["zero_point"])
+                        except KeyError:
+                            attn_sym_scale = None
+                            value_sym_scale = None
+                        if attn_sym_scale is not None and value_sym_scale is not None:
+                            append_approx_gemmini_matmul(
+                                a_source=rewritten_inputs[0],
+                                a_sym_scale=attn_sym_scale,
+                                b_source=b_info["source"],
+                                b_sym_scale=value_sym_scale,
+                                out_names=list(node.output),
+                                prefix=prefix,
+                                raw_name=node.name or node.output[0],
+                            )
+                            lowered_counts["repq_log_matmul"] += 1
+                            continue
+                    profile_attrs = make_profile_attrs(node.name or node.output[0])
                     rewritten.append(
                         helper.make_node(
                             "RepQLogMatMul",
@@ -710,6 +837,8 @@ def lower_qlinear_matmul_nodes(
                             domain="ivit",
                             name=unique_name(f"{prefix}_RepQLogMatMul"),
                             n_bits=int(get_attr(repq_node, "n_bits", 8)),
+                            approximate=approximate_attr,
+                            **profile_attrs,
                         )
                     )
                     lowered_counts["repq_log_matmul"] += 1
@@ -721,6 +850,29 @@ def lower_qlinear_matmul_nodes(
                 weight_info is not None
                 and linear_qinfo is not None
             ):
+                if repq_gemmini_kernel_mode == "approx":
+                    try:
+                        a_sym_scale = sym_scale_from_uniform_params(linear_qinfo["scale"], linear_qinfo["zero_point"])
+                        b_sym_scale = sym_scale_from_uniform_params(weight_info["scale"], weight_info["zero_point"])
+                        b_const = quantize_int8(init_map[weight_info["source"]].astype(np.float32), b_sym_scale)
+                    except KeyError:
+                        a_sym_scale = None
+                        b_sym_scale = None
+                        b_const = None
+                    if a_sym_scale is not None and b_sym_scale is not None and b_const is not None:
+                        append_approx_gemmini_matmul(
+                            a_source=linear_qinfo["source"],
+                            a_sym_scale=a_sym_scale,
+                            b_source=None,
+                            b_sym_scale=b_sym_scale,
+                            out_names=list(node.output),
+                            prefix=prefix,
+                            raw_name=node.name or node.output[0],
+                            b_const_int8=b_const,
+                        )
+                        lowered_counts["repq_uniform_matmul"] += 1
+                        continue
+                profile_attrs = make_profile_attrs(node.name or node.output[0])
                 rewritten.append(
                     helper.make_node(
                         "RepQUniformMatMul",
@@ -736,6 +888,8 @@ def lower_qlinear_matmul_nodes(
                         domain="ivit",
                         name=unique_name(f"{prefix}_RepQUniformMatMul"),
                         n_bits=int(n_bits),
+                        approximate=approximate_attr,
+                        **profile_attrs,
                     )
                 )
                 lowered_counts["repq_uniform_matmul"] += 1
@@ -745,6 +899,26 @@ def lower_qlinear_matmul_nodes(
                 a_info = parse_uniform_dequant(original_inputs[0])
                 b_info = parse_uniform_dequant(original_inputs[1])
                 if a_info is not None and b_info is not None:
+                    if repq_gemmini_kernel_mode == "approx":
+                        try:
+                            a_sym_scale = sym_scale_from_uniform_params(a_info["scale"], a_info["zero_point"])
+                            b_sym_scale = sym_scale_from_uniform_params(b_info["scale"], b_info["zero_point"])
+                        except KeyError:
+                            a_sym_scale = None
+                            b_sym_scale = None
+                        if a_sym_scale is not None and b_sym_scale is not None:
+                            append_approx_gemmini_matmul(
+                                a_source=a_info["source"],
+                                a_sym_scale=a_sym_scale,
+                                b_source=b_info["source"],
+                                b_sym_scale=b_sym_scale,
+                                out_names=list(node.output),
+                                prefix=prefix,
+                                raw_name=node.name or node.output[0],
+                            )
+                            lowered_counts["repq_uniform_matmul"] += 1
+                            continue
+                    profile_attrs = make_profile_attrs(node.name or node.output[0])
                     rewritten.append(
                         helper.make_node(
                             "RepQUniformMatMul",
@@ -760,6 +934,8 @@ def lower_qlinear_matmul_nodes(
                             domain="ivit",
                             name=unique_name(f"{prefix}_RepQUniformMatMul"),
                             n_bits=int(n_bits),
+                            approximate=approximate_attr,
+                            **profile_attrs,
                         )
                     )
                     lowered_counts["repq_uniform_matmul"] += 1
@@ -850,6 +1026,40 @@ def lower_qlinear_matmul_nodes(
                 w_info = parse_exact_weight_input(original_inputs[1], force_transpose=True)
                 bias_name = original_inputs[2] if len(original_inputs) > 2 else None
                 if a_info is not None and w_info is not None and bias_name is not None:
+                    if repq_gemmini_kernel_mode == "approx":
+                        try:
+                            a_sym_scale = sym_scale_from_uniform_params(a_info["scale"], a_info["zero_point"])
+                            b_sym_scale = sym_scale_from_uniform_params(w_info["scale"], w_info["zero_point"])
+                            b_const = quantize_int8(init_map[w_info["source"]].astype(np.float32), b_sym_scale)
+                        except KeyError:
+                            a_sym_scale = None
+                            b_sym_scale = None
+                            b_const = None
+                        if a_sym_scale is not None and b_sym_scale is not None and b_const is not None:
+                            qmm_output = unique_name(f"{prefix}_approx_uniform")
+                            append_approx_gemmini_matmul(
+                                a_source=a_info["source"],
+                                a_sym_scale=a_sym_scale,
+                                b_source=None,
+                                b_sym_scale=b_sym_scale,
+                                out_names=[qmm_output],
+                                prefix=prefix,
+                                raw_name=node.name or node.output[0],
+                                b_const_int8=b_const,
+                            )
+                            add_output = unique_name(f"{prefix}_bias_add")
+                            rewritten.append(
+                                helper.make_node(
+                                    "Add",
+                                    [qmm_output, bias_name],
+                                    [add_output],
+                                    name=unique_name(f"{prefix}_AddBias"),
+                                )
+                            )
+                            replace_output[node.output[0]] = add_output
+                            lowered_counts["repq_uniform_matmul"] += 1
+                            continue
+                    profile_attrs = make_profile_attrs(node.name or node.output[0])
                     qmm_output = unique_name(f"{prefix}_uniform")
                     rewritten.append(
                         helper.make_node(
@@ -866,6 +1076,8 @@ def lower_qlinear_matmul_nodes(
                             domain="ivit",
                             name=unique_name(f"{prefix}_RepQUniformMatMul"),
                             n_bits=int(n_bits),
+                            approximate=approximate_attr,
+                            **profile_attrs,
                         )
                     )
                     add_output = unique_name(f"{prefix}_bias_add")
@@ -1005,6 +1217,16 @@ def main() -> int:
     seed_everything(args.seed)
     device = resolve_device(args.device)
 
+    if (
+        not args.lower_qlinear_matmul
+        and "lowered" in args.output.name
+    ):
+        print(
+            "[WARN] Output filename suggests a lowered graph, but "
+            "--lower-qlinear-matmul is disabled. "
+            "The export will remain a semantic ONNX graph."
+        )
+
     calib_data, export_data = build_example_inputs(args, device)
     q_model = prepare_quantized_model(args, device, calib_data)
 
@@ -1033,12 +1255,18 @@ def main() -> int:
     )
 
     if args.lower_qlinear_matmul:
-        lowered_counts = lower_qlinear_matmul_nodes(args.output, lowering_stats or {}, n_bits=args.a_bits)
+        lowered_counts = lower_qlinear_matmul_nodes(
+            args.output,
+            lowering_stats or {},
+            n_bits=args.a_bits,
+            repq_gemmini_kernel_mode=args.repq_gemmini_kernel_mode,
+        )
         print(
             "Lowered Gemmini-friendly ops: "
             f"conv={lowered_counts['qlinear_conv']} "
             f"repq_uniform_matmul={lowered_counts['repq_uniform_matmul']} "
-            f"repq_log_matmul={lowered_counts['repq_log_matmul']}"
+            f"repq_log_matmul={lowered_counts['repq_log_matmul']} "
+            f"mode={args.repq_gemmini_kernel_mode}"
         )
 
     if not args.skip_onnx_checker:

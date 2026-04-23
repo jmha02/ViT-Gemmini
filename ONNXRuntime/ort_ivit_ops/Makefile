@@ -10,9 +10,15 @@ REPO_ROOT ?= $(abspath ../..)
 ORT_RISCV_DIR ?= $(REPO_ROOT)/tvm-gemmini/3rdparty/gemmini/software/onnxruntime-riscv
 BUILD_DIR ?= $(REPO_ROOT)/build/ort/ort_ivit_ops
 
+ifneq ($(RISCV),)
+RISCV_CC ?= $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc
+RISCV_CXX ?= $(RISCV)/bin/riscv64-unknown-linux-gnu-g++
+RISCV_AR ?= $(RISCV)/bin/riscv64-unknown-linux-gnu-gcc-ar
+else
 RISCV_CC ?= riscv64-unknown-linux-gnu-gcc
 RISCV_CXX ?= riscv64-unknown-linux-gnu-g++
 RISCV_AR ?= riscv64-unknown-linux-gnu-ar
+endif
 HOST_CC ?= cc
 HOST_CXX ?= c++
 

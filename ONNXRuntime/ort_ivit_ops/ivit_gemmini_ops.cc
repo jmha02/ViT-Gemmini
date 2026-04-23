@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "onnxruntime_c_api.h"
@@ -34,6 +35,64 @@ inline int clamp_mode(int mode) {
         return 0;
     }
     return mode;
+}
+
+static inline void ort_profile_cycle_barrier(void) {
+    asm volatile ("" ::: "memory");
+}
+
+static inline uint64_t ort_profile_read_cycles(void) {
+#if defined(__riscv)
+    uint64_t cycles = 0;
+    ort_profile_cycle_barrier();
+    asm volatile("rdcycle %0" : "=r"(cycles) : : "memory");
+    ort_profile_cycle_barrier();
+    return cycles;
+#else
+    return 0;
+#endif
+}
+
+int64_t get_optional_int64_attribute(const OrtApi* api, const OrtKernelInfo* info, const char* name, int64_t default_value) {
+    int64_t value = default_value;
+    OrtStatus* status = api->KernelInfoGetAttribute_int64(info, name, &value);
+    if (status != nullptr) {
+        api->ReleaseStatus(status);
+        return default_value;
+    }
+    return value;
+}
+
+std::string get_optional_string_attribute(const OrtApi* api, const OrtKernelInfo* info, const char* name) {
+    size_t size = 0;
+    OrtStatus* status = api->KernelInfoGetAttribute_string(info, name, nullptr, &size);
+    if (status != nullptr) {
+        api->ReleaseStatus(status);
+        return "";
+    }
+    std::string value(size, '\0');
+    status = api->KernelInfoGetAttribute_string(info, name, value.data(), &size);
+    if (status != nullptr) {
+        api->ReleaseStatus(status);
+        return "";
+    }
+    if (!value.empty() && value.back() == '\0') {
+        value.pop_back();
+    }
+    return value;
+}
+
+void ort_log_node_cycles(int64_t node_index, const std::string& node_name, const char* op_type, uint64_t cycles) {
+    if (node_index < 0 || node_name.empty()) {
+        return;
+    }
+    std::printf(
+        "[ORT_NODE_CYCLES],%lld,%s,%s,CPUExecutionProvider,%llu\n",
+        static_cast<long long>(node_index),
+        node_name.c_str(),
+        op_type,
+        static_cast<unsigned long long>(cycles)
+    );
 }
 
 void cpu_matmul_int32(const int8_t* a, const int8_t* b, int32_t* y,
@@ -202,6 +261,39 @@ bool scale_is_scalar(const OrtApi* ort, const OrtValue* scale_value) {
     return false;
 }
 
+inline float safe_scale(float scale) {
+    return std::max(scale, 1e-8f);
+}
+
+float repq_sym_scale_from_uniform_params(
+        const float* scales,
+        bool scalar_scale,
+        const float* zero_points,
+        bool scalar_zero_point,
+        int64_t cols,
+        int32_t n_bits) {
+    const float levels = static_cast<float>((1 << n_bits) - 1);
+    float max_abs = 0.0f;
+    for (int64_t col = 0; col < cols; ++col) {
+        const float scale = scalar_scale ? scales[0] : scales[col];
+        const float zp = scalar_zero_point ? zero_points[0] : zero_points[col];
+        const float qmin = -zp;
+        const float qmax = levels - zp;
+        max_abs = std::max(max_abs, std::abs(qmin * scale));
+        max_abs = std::max(max_abs, std::abs(qmax * scale));
+    }
+    return safe_scale(max_abs / 127.0f);
+}
+
+inline float repq_sym_scale_from_log_delta(float delta) {
+    return safe_scale(std::abs(delta) / 127.0f);
+}
+
+inline int8_t quantize_sym_int8_scalar(float value, float scale) {
+    const long long q = std::llround(static_cast<double>(value) / static_cast<double>(safe_scale(scale)));
+    return clamp_to_type<int8_t>(std::clamp(q, -127LL, 127LL));
+}
+
 struct FixedPointScale {
     int64_t mantissa;
     int32_t exponent;
@@ -267,14 +359,17 @@ void requantize_tensor_fixedpoint_same_shape(const OrtApi* ort, OrtKernelContext
 
 struct GemminiMatMulIntegerKernel {
     const OrtApi* ort;
+    int64_t profile_node_index;
+    std::string profile_label;
 };
 
 void* ORT_API_CALL GemminiMatMulInteger_CreateKernel(
         const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
     (void)op;
-    (void)info;
     auto* kernel = new GemminiMatMulIntegerKernel();
     kernel->ort = api;
+    kernel->profile_node_index = get_optional_int64_attribute(api, info, "profile_node_index", -1);
+    kernel->profile_label = get_optional_string_attribute(api, info, "profile_label");
     return kernel;
 }
 
@@ -285,6 +380,15 @@ void ORT_API_CALL GemminiMatMulInteger_Destroy(void* op_kernel) {
 void ORT_API_CALL GemminiMatMulInteger_Compute(void* op_kernel, OrtKernelContext* ctx) {
     auto* kernel = static_cast<GemminiMatMulIntegerKernel*>(op_kernel);
     const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+    const auto finish_profile = [&]() {
+        ort_log_node_cycles(
+            kernel->profile_node_index,
+            kernel->profile_label,
+            "GemminiMatMulInteger",
+            ort_profile_read_cycles() - profile_start
+        );
+    };
 
     const OrtValue* a_value = nullptr;
     const OrtValue* b_value = nullptr;
@@ -341,6 +445,7 @@ void ORT_API_CALL GemminiMatMulInteger_Compute(void* op_kernel, OrtKernelContext
         cpu_matmul_int32(a_ptr, b_ptr, out_ptr, rows, cols, depth);
     }
 #endif
+    finish_profile();
 }
 
 const char* ORT_API_CALL GemminiMatMulInteger_GetName(const OrtCustomOp* op) {
@@ -1408,6 +1513,9 @@ inline float repq_log_value_from_code(int32_t q, float delta) {
 struct RepQLogMatMulKernel {
     const OrtApi* ort;
     int32_t n_bits;
+    bool approximate;
+    int64_t profile_node_index;
+    std::string profile_label;
 };
 
 void* ORT_API_CALL RepQLogMatMul_CreateKernel(
@@ -1415,9 +1523,12 @@ void* ORT_API_CALL RepQLogMatMul_CreateKernel(
     (void)op;
     auto* kernel = new RepQLogMatMulKernel();
     kernel->ort = api;
-    int64_t n_bits = 8;
-    api->KernelInfoGetAttribute_int64(info, "n_bits", &n_bits);
+    int64_t n_bits = get_optional_int64_attribute(api, info, "n_bits", 8);
     kernel->n_bits = static_cast<int32_t>(n_bits);
+    const int64_t approximate = get_optional_int64_attribute(api, info, "approximate", 0);
+    kernel->approximate = approximate != 0;
+    kernel->profile_node_index = get_optional_int64_attribute(api, info, "profile_node_index", -1);
+    kernel->profile_label = get_optional_string_attribute(api, info, "profile_label");
     return kernel;
 }
 
@@ -1428,6 +1539,15 @@ void ORT_API_CALL RepQLogMatMul_Destroy(void* op_kernel) {
 void ORT_API_CALL RepQLogMatMul_Compute(void* op_kernel, OrtKernelContext* ctx) {
     auto* kernel = static_cast<RepQLogMatMulKernel*>(op_kernel);
     const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+    const auto finish_profile = [&]() {
+        ort_log_node_cycles(
+            kernel->profile_node_index,
+            kernel->profile_label,
+            "RepQLogMatMul",
+            ort_profile_read_cycles() - profile_start
+        );
+    };
 
     const OrtValue* a_value = nullptr;
     const OrtValue* delta_value = nullptr;
@@ -1463,12 +1583,72 @@ void ORT_API_CALL RepQLogMatMul_Compute(void* op_kernel, OrtKernelContext* ctx) 
     std::fill(out, out + batch * out_stride, 0.0f);
 
     if (!(delta > 0.0f) || !(b_scale > 0.0f)) {
+        finish_profile();
         return;
     }
 
     const float* a = get_tensor_data<float>(ort, a_value);
     const float* b = get_tensor_data<float>(ort, b_value);
     const int mode = clamp_mode(g_ivit_execution_mode);
+
+    if (kernel->approximate) {
+        const float attn_sym_scale = repq_sym_scale_from_log_delta(delta);
+        const float value_sym_scale = repq_sym_scale_from_uniform_params(
+            &b_scale,
+            true,
+            &b_zp_f,
+            true,
+            1,
+            kernel->n_bits
+        );
+
+        std::vector<int8_t> a_quant(static_cast<size_t>(a_stride), 0);
+        std::vector<int8_t> b_quant(static_cast<size_t>(depth * cols), 0);
+        std::vector<int32_t> temp(static_cast<size_t>(out_stride), 0);
+
+        for (int64_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+            const float* a_ptr = a + batch_idx * a_stride;
+            const float* b_ptr = (b_dims.size() == 2) ? b : (b + batch_idx * b_stride);
+            float* out_ptr = out + batch_idx * out_stride;
+
+            std::fill(a_quant.begin(), a_quant.end(), static_cast<int8_t>(0));
+            std::fill(b_quant.begin(), b_quant.end(), static_cast<int8_t>(0));
+            std::fill(temp.begin(), temp.end(), 0);
+
+            for (int64_t idx = 0; idx < a_stride; ++idx) {
+                const int32_t q_code = quantize_repq_log_code(a_ptr[idx], delta, levels);
+                const float q_value = (q_code < 0) ? 0.0f : repq_log_value_from_code(q_code, delta);
+                a_quant[static_cast<size_t>(idx)] = quantize_sym_int8_scalar(q_value, attn_sym_scale);
+            }
+            for (int64_t idx = 0; idx < depth * cols; ++idx) {
+                b_quant[static_cast<size_t>(idx)] = quantize_sym_int8_scalar(b_ptr[idx], value_sym_scale);
+            }
+
+#ifdef IVIT_USE_GEMMINI
+            static int repq_log_matmul_approx_prints = 0;
+            if (mode != 0 && repq_log_matmul_approx_prints < 8) {
+                std::printf("RepQLogMatMul approx using Gemmini (%lld, %lld, %lld)\n",
+                            static_cast<long long>(rows),
+                            static_cast<long long>(cols),
+                            static_cast<long long>(depth));
+                ++repq_log_matmul_approx_prints;
+            }
+            if (mode == 0) {
+                cpu_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth);
+            } else {
+                gemmini_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth, mode);
+            }
+#else
+            cpu_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth);
+#endif
+
+            for (int64_t idx = 0; idx < out_stride; ++idx) {
+                out_ptr[idx] = attn_sym_scale * value_sym_scale * static_cast<float>(temp[static_cast<size_t>(idx)]);
+            }
+        }
+        finish_profile();
+        return;
+    }
 
     std::vector<int32_t> q_codes(static_cast<size_t>(a_stride), -1);
     std::vector<uint8_t> active(levels, 0);
@@ -1558,6 +1738,7 @@ void ORT_API_CALL RepQLogMatMul_Compute(void* op_kernel, OrtKernelContext* ctx) 
             }
         }
     }
+    finish_profile();
 }
 
 const char* ORT_API_CALL RepQLogMatMul_GetName(const OrtCustomOp* op) {
@@ -1630,19 +1811,21 @@ OrtCustomOp make_repq_log_matmul_op() {
 struct RepQUniformMatMulKernel {
     const OrtApi* ort;
     int n_bits;
+    bool approximate;
+    int64_t profile_node_index;
+    std::string profile_label;
 };
 
 void* ORT_API_CALL RepQUniformMatMul_CreateKernel(
         const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
     auto* kernel = new RepQUniformMatMulKernel();
     kernel->ort = api;
-    int64_t n_bits = 8;
-    OrtStatus* status = api->KernelInfoGetAttribute_int64(info, "n_bits", &n_bits);
-    if (status != nullptr) {
-        api->ReleaseStatus(status);
-        n_bits = 8;
-    }
+    int64_t n_bits = get_optional_int64_attribute(api, info, "n_bits", 8);
     kernel->n_bits = static_cast<int>(n_bits);
+    const int64_t approximate = get_optional_int64_attribute(api, info, "approximate", 0);
+    kernel->approximate = approximate != 0;
+    kernel->profile_node_index = get_optional_int64_attribute(api, info, "profile_node_index", -1);
+    kernel->profile_label = get_optional_string_attribute(api, info, "profile_label");
     return kernel;
 }
 
@@ -1653,6 +1836,15 @@ void ORT_API_CALL RepQUniformMatMul_Destroy(void* op_kernel) {
 void ORT_API_CALL RepQUniformMatMul_Compute(void* op_kernel, OrtKernelContext* ctx) {
     auto* kernel = static_cast<RepQUniformMatMulKernel*>(op_kernel);
     const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+    const auto finish_profile = [&]() {
+        ort_log_node_cycles(
+            kernel->profile_node_index,
+            kernel->profile_label,
+            "RepQUniformMatMul",
+            ort_profile_read_cycles() - profile_start
+        );
+    };
 
     const OrtValue* a_value = nullptr;
     const OrtValue* a_scale_value = nullptr;
@@ -1697,6 +1889,7 @@ void ORT_API_CALL RepQUniformMatMul_Compute(void* op_kernel, OrtKernelContext* c
     std::fill(out, out + batch * out_stride, 0.0f);
 
     if (!(a_scale > 0.0f)) {
+        finish_profile();
         return;
     }
 
@@ -1706,6 +1899,70 @@ void ORT_API_CALL RepQUniformMatMul_Compute(void* op_kernel, OrtKernelContext* c
     const float* b_zps = get_tensor_data<float>(ort, b_zp_value);
     const int levels = 1 << kernel->n_bits;
     const int mode = clamp_mode(g_ivit_execution_mode);
+
+    if (kernel->approximate) {
+        const float a_sym_scale = repq_sym_scale_from_uniform_params(
+            &a_scale,
+            true,
+            &a_zp,
+            true,
+            1,
+            kernel->n_bits
+        );
+        const float b_sym_scale = repq_sym_scale_from_uniform_params(
+            b_scales,
+            b_scale_scalar,
+            b_zps,
+            b_zp_scalar,
+            cols,
+            kernel->n_bits
+        );
+
+        std::vector<int8_t> a_quant(static_cast<size_t>(a_stride), 0);
+        std::vector<int8_t> b_quant(static_cast<size_t>(depth * cols), 0);
+        std::vector<int32_t> temp(static_cast<size_t>(out_stride), 0);
+
+        for (int64_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+            const float* a_ptr = a + batch_idx * a_stride;
+            const float* b_ptr = (b_dims.size() == 2) ? b : (b + batch_idx * b_stride);
+            float* out_ptr = out + batch_idx * out_stride;
+
+            std::fill(a_quant.begin(), a_quant.end(), static_cast<int8_t>(0));
+            std::fill(b_quant.begin(), b_quant.end(), static_cast<int8_t>(0));
+            std::fill(temp.begin(), temp.end(), 0);
+
+            for (int64_t idx = 0; idx < a_stride; ++idx) {
+                a_quant[static_cast<size_t>(idx)] = quantize_sym_int8_scalar(a_ptr[idx], a_sym_scale);
+            }
+            for (int64_t idx = 0; idx < depth * cols; ++idx) {
+                b_quant[static_cast<size_t>(idx)] = quantize_sym_int8_scalar(b_ptr[idx], b_sym_scale);
+            }
+
+#ifdef IVIT_USE_GEMMINI
+            static int repq_uniform_matmul_approx_prints = 0;
+            if (mode != 0 && repq_uniform_matmul_approx_prints < 8) {
+                std::printf("RepQUniformMatMul approx using Gemmini (%lld, %lld, %lld)\n",
+                            static_cast<long long>(rows),
+                            static_cast<long long>(cols),
+                            static_cast<long long>(depth));
+                ++repq_uniform_matmul_approx_prints;
+            }
+            if (mode == 0) {
+                cpu_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth);
+            } else {
+                gemmini_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth, mode);
+            }
+#else
+            cpu_matmul_int32(a_quant.data(), b_quant.data(), temp.data(), rows, cols, depth);
+#endif
+
+            for (int64_t idx = 0; idx < out_stride; ++idx) {
+                out_ptr[idx] = a_sym_scale * b_sym_scale * static_cast<float>(temp[static_cast<size_t>(idx)]);
+            }
+        }
+        finish_profile();
+        return;
+    }
 
     const long long a_qmin = static_cast<long long>(std::ceil(-static_cast<double>(a_zp)));
     const long long a_qmax = static_cast<long long>(std::floor(static_cast<double>(levels - 1) - static_cast<double>(a_zp)));
@@ -1808,6 +2065,7 @@ void ORT_API_CALL RepQUniformMatMul_Compute(void* op_kernel, OrtKernelContext* c
             }
         }
     }
+    finish_profile();
 }
 
 const char* ORT_API_CALL RepQUniformMatMul_GetName(const OrtCustomOp* op) {
