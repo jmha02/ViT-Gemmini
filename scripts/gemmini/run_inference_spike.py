@@ -35,21 +35,19 @@ sys.path.insert(0, str(TVM_SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_CHIPYARD_DIR = pathlib.Path(os.environ.get("CHIPYARD_DIR", "/root/flexi/chipyard"))
-DEFAULT_RISCV_DIR = pathlib.Path(
-    os.environ.get("RISCV", str(DEFAULT_CHIPYARD_DIR / ".conda-env" / "riscv-tools"))
-)
-DEFAULT_TVM_HOME = pathlib.Path(os.environ.get("TVM_HOME", str(REPO_ROOT / "tvm-gemmini")))
-TVM_PYTHON = DEFAULT_TVM_HOME / "python"
-if TVM_PYTHON.exists() and str(TVM_PYTHON) not in sys.path:
-    sys.path.insert(0, str(TVM_PYTHON))
-
 import torch
 from PIL import Image
 import tvm
 from tvm import relay
 import tvm.contrib.gemmini as gemmini
 from tvm.contrib.gemmini.legalize import LegalizeGemmini
+from tvm.relay.op.contrib.gemmini_byoc import (
+    enabled as gemmini_byoc_enabled,
+    llvm_riscv_target,
+    partition_for_gemmini,
+)
+from tvm.ir.memory_pools import ConstantPoolInfo
+from tvm.relay.build_module import bind_params_by_name
 
 from models.ivit.builder import get_workload
 import pytorch_to_tvm_params as convert_model
@@ -57,11 +55,94 @@ import pytorch_to_tvm_params as convert_model
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+SATURN_SPIKE_ISA = "rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm"
+SATURN_LINK_MARCH = "rv64gcv_zvl512b_zicntr_zicsr"
+
+
+def riscv_march_enables_v(march: str) -> bool:
+    """True if march enables the V (or Zve*) vector extension.
+
+    Note: do not use ``\"v\" in march`` — that matches the ``v`` in ``rv64gc``.
+    """
+    m = (march or "").lower().strip()
+    if not m:
+        return False
+    if "_zve" in m or "+zve" in m or m.startswith("zve"):
+        return True
+    # LLVM feature lists sometimes use +v
+    if re.search(r"(^|[,+])v([,+]|$)", m):
+        return True
+    mo = re.match(r"rv(?:32|64|128)?([a-z0-9]*)", m)
+    if mo:
+        return "v" in mo.group(1)
+    return False
 IMAGENET_CLASSES = None
+
 MODEL_SPECS = {
     "deit_tiny_patch16_224": {"embed_dim": 192, "depth": 12},
+    "deit_small_patch16_224": {"embed_dim": 384, "depth": 12},
+    "fq_deit_tiny_patch16_224": {"embed_dim": 192, "depth": 12},
+    "ptq4_deit_tiny_patch16_224": {"embed_dim": 192, "depth": 12},
+    "ptq4_deit_small_patch16_224": {"embed_dim": 384, "depth": 12},
     "swin_tiny_patch4_window7_224": {"embed_dim": 768, "depth": 12},
+    "swin_small_patch4_window7_224": {"embed_dim": 768, "depth": 24},
 }
+
+
+def _random_state_model_name(model_name):
+    if model_name == "fq_deit_tiny_patch16_224":
+        raise RuntimeError("fq_deit_tiny_patch16_224 requires flexi e2e_model.pt checkpoint")
+    if model_name.startswith("ptq4_deit_"):
+        raise RuntimeError(f"{model_name}: use flexi e2e_model.pt or get_workload random scaffold")
+    return model_name
+
+
+def build_random_qat_state_dict(model_name):
+    ivit_root = REPO_ROOT / "I-ViT"
+    state_model_name = _random_state_model_name(model_name)
+
+    # This runner imports the local `models.ivit` package before this point. The
+    # vendored I-ViT tree also uses the top-level package name `models`, so build
+    # the throwaway random QAT checkpoint in a clean subprocess.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    script = r"""
+import sys
+import torch
+
+ivit_root, model_name, output_path = sys.argv[1:4]
+sys.path.insert(0, ivit_root)
+
+from models.model_utils import freeze_model
+from models.swin_quant import swin_small_patch4_window7_224, swin_tiny_patch4_window7_224
+from models.vit_quant import deit_small_patch16_224, deit_tiny_patch16_224
+
+builders = {
+    "deit_tiny_patch16_224": deit_tiny_patch16_224,
+    "deit_small_patch16_224": deit_small_patch16_224,
+    "swin_tiny_patch4_window7_224": swin_tiny_patch4_window7_224,
+    "swin_small_patch4_window7_224": swin_small_patch4_window7_224,
+}
+model = builders[model_name](pretrained=False).eval()
+freeze_model(model)
+with torch.no_grad():
+    model(torch.randn(1, 3, 224, 224))
+torch.save(model.state_dict(), output_path)
+"""
+    try:
+        subprocess.run(
+            [sys.executable, "-c", script, str(ivit_root), state_model_name, tmp_path],
+            check=True,
+        )
+        return torch.load(tmp_path, map_location="cpu")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def maybe_raise_stack_limit_for_build(model_name, opt_level):
@@ -83,6 +164,33 @@ def maybe_raise_stack_limit_for_build(model_name, opt_level):
 
     new_soft, _ = resource.getrlimit(resource.RLIMIT_STACK)
     return soft, new_soft
+
+
+def preprocess_for_heterogeneous_gemmini(mod, model_name, canonicalize_qnn=False):
+    """Partition Gemmini matmuls for BYOC; leave CPU epilogues on LLVM host."""
+    if model_name.startswith("swin_"):
+        pattern = relay.op.contrib.get_pattern_table("gemmini")
+        mod = relay.transform.InferType()(mod)
+        mod = relay.transform.ConvertLayout({"qnn.conv2d": ["NHWC", "HWIO"]})(mod)
+        mod = relay.transform.FoldConstant()(mod)
+        mod = relay.transform.MergeComposite(pattern)(mod)
+        mod = relay.transform.InferType()(mod)
+        mod = LegalizeGemmini()(mod)
+        mod = relay.transform.InferType()(mod)
+        mod = relay.transform.AnnotateTarget("gemmini")(mod)
+        mod = relay.transform.MergeCompilerRegions()(mod)
+        mod = relay.transform.PartitionGraph()(mod)
+        mod = relay.transform.InferType()(mod)
+        if canonicalize_qnn:
+            mod = relay.qnn.transform.CanonicalizeOps()(mod)
+            mod = relay.transform.FoldConstant()(mod)
+            mod = relay.transform.InferType()(mod)
+        return mod
+
+    mod = relay.transform.InferType()(mod)
+    mod = relay.transform.ConvertLayout({"qnn.conv2d": ["NHWC", "HWIO"]})(mod)
+    mod = relay.transform.SimplifyExpr()(mod)
+    return partition_for_gemmini(mod)
 
 
 def preprocess_for_gemmini(mod, model_name, canonicalize_qnn=False):
@@ -135,6 +243,26 @@ def load_imagenet_classes():
     return IMAGENET_CLASSES
 
 
+def preprocess_image_float(image_path):
+    """Preprocess image to float32 NCHW for FQ-DeiT (flexi FQViT prologue)."""
+    img = Image.open(image_path).convert("RGB")
+
+    width, height = img.size
+    scale = 256 / min(width, height)
+    new_width = int(width * scale)
+    new_height = int(height * scale)
+    img = img.resize((new_width, new_height), Image.BILINEAR)
+
+    left = (new_width - 224) // 2
+    top = (new_height - 224) // 2
+    img = img.crop((left, top, left + 224, top + 224))
+
+    img_np = np.array(img, dtype=np.float32) / 255.0
+    img_np = (img_np - IMAGENET_MEAN) / IMAGENET_STD
+    img_np = img_np.transpose(2, 0, 1)
+    return np.expand_dims(img_np, axis=0)
+
+
 def preprocess_image(image_path, input_scale):
     """
     Preprocess image for I-ViT inference.
@@ -172,7 +300,7 @@ def _extract_main_input_spec(mod):
     main = mod["main"]
     data_param = None
     for param in main.params:
-        if param.name_hint == "data":
+        if param.name_hint in ("data", "image"):
             data_param = param
             break
     if data_param is None:
@@ -217,12 +345,28 @@ def _generate_synthetic_input(shape, dtype, seed=0):
     raise RuntimeError(f"Unsupported standalone input dtype: {dtype}")
 
 
-def prepare_input_data(image_path, input_scale, input_spec):
+def prepare_input_data(
+    image_path,
+    input_scale,
+    input_spec,
+    *,
+    force_synthetic=False,
+    synthetic_seed=0,
+    model_name=None,
+):
     shape = input_spec["shape"]
     dtype = input_spec["dtype"]
+    if force_synthetic:
+        return _generate_synthetic_input(shape, dtype, seed=synthetic_seed), "synthetic"
+    if model_name and (
+        model_name.startswith("fq_deit_") or model_name.startswith("ptq4_deit_")
+    ) and dtype == "float32":
+        if image_path.exists():
+            return preprocess_image_float(image_path), "real_image_float"
+        return _generate_synthetic_input(shape, dtype, seed=synthetic_seed), "synthetic"
     if _is_real_image_input(shape, dtype):
         return preprocess_image(image_path, input_scale), "real_image"
-    return _generate_synthetic_input(shape, dtype), "synthetic"
+    return _generate_synthetic_input(shape, dtype, seed=synthetic_seed), "synthetic"
 
 
 def create_real_image_harness(
@@ -233,6 +377,7 @@ def create_real_image_harness(
     classification_output=True,
     debug_unit=None,
     uart_mode="full",
+    enable_spike_rvv=False,
 ):
     """Create test harness with embedded input bytes."""
 
@@ -241,6 +386,15 @@ def create_real_image_harness(
     input_size_bytes = input_bytes.size
     run_mode = "classification" if classification_output else "debug"
     debug_label = debug_unit if debug_unit is not None else "full_model"
+    spike_rvv_prologue = ""
+    if enable_spike_rvv:
+        # Stock Spike traps on vsetvli unless mstatus.VS != OFF (crt.S only sets FS|XS).
+        # Also clear vtype.vill (set at reset): Saturn traps whole-register vl2r.v/vs2r.v
+        # while vill=1, and LLVM emits them on paths with no preceding vsetvli.
+        spike_rvv_prologue = (
+            '    asm volatile("li t0, 0x600\\n csrs mstatus, t0\\n'
+            ' vsetvli t0, zero, e8, m1, ta, ma" ::: "t0");\n'
+        )
     prologue_code = ""
     pre_run_code = ""
     post_run_code = ""
@@ -263,6 +417,9 @@ def create_real_image_harness(
     print_str(",");
     print_dec(checksum);
     print_str("\\n");
+    print_str("[TVM_MAIN_TOTAL_CYCLES],");
+    print_dec(cycles);
+    print_str("\\n");
     if (status != 0) {{
         spike_exit(1);
     }}
@@ -282,6 +439,9 @@ def create_real_image_harness(
     print_str("Results\\n");
     print_str("========================================\\n");
     print_str("Cycles: ");
+    print_dec(cycles);
+    print_str("\\n");
+    print_str("[TVM_MAIN_TOTAL_CYCLES],");
     print_dec(cycles);
     print_str("\\n\\n");
 """
@@ -329,6 +489,9 @@ def create_real_image_harness(
     print_str("Results\\n");
     print_str("========================================\\n");
     print_str("Cycles: ");
+    print_dec(cycles);
+    print_str("\\n");
+    print_str("[TVM_MAIN_TOTAL_CYCLES],");
     print_dec(cycles);
     print_str("\\n");
 """
@@ -411,7 +574,7 @@ volatile uint64_t g_cycles = 0;
 volatile uint64_t g_checksum = 0;
 
 int main() {{
-{prologue_code}
+{spike_rvv_prologue}{prologue_code}
     
     struct tvmgen_default_inputs inputs;
     inputs.data = (void*)input_data;
@@ -447,6 +610,133 @@ int main() {{
     return harness_path
 
 
+def split_oversized_tvm_main_for_riscv_link(
+    output_dir,
+    *,
+    kernel_chunk_size=120,
+    setup_chunk_size=1200,
+):
+    """Split giant tvm_main into smaller helpers to avoid R_RISCV_JAL truncation."""
+    tvm_main_path = _find_tvm_main_source(output_dir)
+    content = tvm_main_path.read_text()
+    if "tvmgen_default___tvm_main_part_" in content:
+        return False
+
+    match = re.search(
+        r"(TVM_DLL int32_t tvmgen_default___tvm_main__\s*\([^)]*\)\s*\{)",
+        content,
+        re.DOTALL,
+    )
+    if not match:
+        return False
+
+    start = match.start(1)
+    brace_open = content.find("{", match.end(1) - 1)
+    depth = 0
+    end = None
+    for idx in range(brace_open, len(content)):
+        ch = content[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx
+                break
+    if end is None:
+        raise RuntimeError(f"Could not parse tvm main body in {tvm_main_path}")
+
+    header = content[:start]
+    signature = match.group(1)
+    body = content[brace_open + 1 : end]
+    footer = content[end + 1 :]
+
+    lines = body.splitlines(keepends=True)
+    sid_names = []
+    prelude_lines = []
+    sid_lines = []
+    kernel_lines = []
+    tail_lines = []
+    seen_sid = False
+    seen_kernel = False
+
+    sid_decl_re = re.compile(r"^\s*void\*\s+(sid_\d+_let)\s*=")
+    kernel_re = re.compile(r"^\s*if \(tvmgen_default_fused_")
+
+    for line in lines:
+        sid_match = sid_decl_re.match(line)
+        if sid_match and not seen_kernel:
+            seen_sid = True
+            sid_names.append(sid_match.group(1))
+            sid_lines.append(re.sub(r"^\s*void\*\s+(sid_\d+_let)\s*=", r"  \1 =", line))
+            continue
+        if kernel_re.match(line):
+            seen_kernel = True
+            kernel_lines.append(line)
+            continue
+        if seen_kernel:
+            tail_lines.append(line)
+        elif seen_sid:
+            sid_lines.append(line)
+        else:
+            prelude_lines.append(line)
+
+    if len(kernel_lines) < kernel_chunk_size:
+        return False
+
+    param_list = (
+        "int8_t* data_buffer_var, float* output_buffer_var, "
+        "uint8_t* global_const_workspace_0_var, uint8_t* global_workspace_1_var"
+    )
+    static_decls = "".join(f"static void* {name};\n" for name in sid_names)
+
+    helpers = []
+    setup_count = 0
+    for chunk_idx in range(0, len(sid_lines), setup_chunk_size):
+        chunk = sid_lines[chunk_idx : chunk_idx + setup_chunk_size]
+        if not any(line.strip() for line in chunk):
+            continue
+        helpers.append(
+            f"static int32_t tvmgen_default___tvm_main_setup_{setup_count}({param_list}) {{\n"
+            + "".join(chunk)
+            + "  return 0;\n}\n\n"
+        )
+        setup_count += 1
+
+    kernel_count = 0
+    for chunk_idx in range(0, len(kernel_lines), kernel_chunk_size):
+        chunk = kernel_lines[chunk_idx : chunk_idx + kernel_chunk_size]
+        helpers.append(
+            f"static int32_t tvmgen_default___tvm_main_kernels_{kernel_count}({param_list}) {{\n"
+            + "".join(chunk)
+            + "  return 0;\n}\n\n"
+        )
+        kernel_count += 1
+
+    main_calls = list(prelude_lines)
+    for part_id in range(setup_count):
+        main_calls.append(
+            f"  if (tvmgen_default___tvm_main_setup_{part_id}("
+            f"data_buffer_var, output_buffer_var, global_const_workspace_0_var, "
+            f"global_workspace_1_var) != 0) return -1;\n"
+        )
+    for part_id in range(kernel_count):
+        main_calls.append(
+            f"  if (tvmgen_default___tvm_main_kernels_{part_id}("
+            f"data_buffer_var, output_buffer_var, global_const_workspace_0_var, "
+            f"global_workspace_1_var) != 0) return -1;\n"
+        )
+
+    new_main = signature + "\n" + "".join(main_calls) + "".join(tail_lines) + "}\n"
+    updated = header + static_decls + "\n" + "".join(helpers) + new_main + footer
+    tvm_main_path.write_text(updated)
+    print(
+        f"[Fix] Split tvm_main into {setup_count} setup + {kernel_count} kernel helpers "
+        f"({len(kernel_lines)} kernel calls)"
+    )
+    return True
+
+
 def _find_tvm_main_source(output_dir):
     codegen_src_dir = output_dir / "codegen" / "host" / "src"
     for candidate in sorted(codegen_src_dir.glob("default_lib*.c")):
@@ -461,18 +751,16 @@ def _find_tvm_main_source(output_dir):
     raise RuntimeError("Could not find generated tvm main source")
 
 
-def instrument_tvm_main_total_cycles(output_dir):
-    tvm_main_path = _find_tvm_main_source(output_dir)
-    content = tvm_main_path.read_text()
+TVM_MAIN_TOTAL_CYCLES_PREFIX = "[TVM_MAIN_TOTAL_CYCLES],"
+TVM_MAIN_INNER_CYCLES_PREFIX = "[TVM_MAIN_INNER_CYCLES],"
 
-    if "[TVM_MAIN_TOTAL_CYCLES]," in content:
-        return
 
-    support_code = """
+def _tvm_profile_support_code(*, inner_cycles_prefix):
+    return f"""
 extern volatile uint64_t tohost;
 extern volatile uint64_t fromhost;
 
-static void tvm_profile_print_char(char c) {
+static void tvm_profile_print_char(char c) {{
   volatile uint64_t magic_mem[8] __attribute__((aligned(64)));
   magic_mem[0] = 64;
   magic_mem[1] = 1;
@@ -483,44 +771,54 @@ static void tvm_profile_print_char(char c) {
   while (fromhost == 0);
   fromhost = 0;
   __sync_synchronize();
-}
+}}
 
-static void tvm_profile_print_str(const char* s) {
+static void tvm_profile_print_str(const char* s) {{
   while (*s) tvm_profile_print_char(*s++);
-}
+}}
 
-static void tvm_profile_print_dec(uint64_t val) {
+static void tvm_profile_print_dec(uint64_t val) {{
   char buf[21];
   int i = 20;
   buf[i] = 0;
-  do {
+  do {{
     buf[--i] = '0' + (val % 10);
     val /= 10;
-  } while (val && i > 0);
+  }} while (val && i > 0);
   tvm_profile_print_str(&buf[i]);
-}
+}}
 
-static inline void tvm_profile_cycle_barrier(void) {
+static inline void tvm_profile_cycle_barrier(void) {{
   asm volatile ("" ::: "memory");
-}
+}}
 
-static inline uint64_t tvm_profile_read_cycles(void) {
+static inline uint64_t tvm_profile_read_cycles(void) {{
   uint64_t cycles;
   tvm_profile_cycle_barrier();
   asm volatile ("rdcycle %0" : "=r" (cycles) : : "memory");
   tvm_profile_cycle_barrier();
   return cycles;
-}
+}}
 
 static uint64_t tvm_profile_main_cycles = 0;
 
-static void tvm_profile_dump_main_cycles(void) {
-  tvm_profile_print_str("[TVM_MAIN_TOTAL_CYCLES],");
+static void tvm_profile_dump_main_cycles(void) {{
+  tvm_profile_print_str("{inner_cycles_prefix}");
   tvm_profile_print_dec(tvm_profile_main_cycles);
   tvm_profile_print_str("\\n");
-}
+}}
 
 """
+
+
+def instrument_tvm_main_total_cycles(output_dir):
+    tvm_main_path = _find_tvm_main_source(output_dir)
+    content = tvm_main_path.read_text()
+
+    if TVM_MAIN_INNER_CYCLES_PREFIX in content:
+        return
+
+    support_code = _tvm_profile_support_code(inner_cycles_prefix=TVM_MAIN_INNER_CYCLES_PREFIX)
     include_token = '#include "tvm/runtime/c_runtime_api.h"\n'
     if include_token not in content:
         raise RuntimeError(f"Could not find TVM runtime include in {tvm_main_path}")
@@ -551,7 +849,49 @@ static void tvm_profile_dump_main_cycles(void) {
         raise RuntimeError("Failed to inject TVM main total cycle dump into tvm main")
 
     tvm_main_path.write_text(updated)
-    print("[Fix] Instrumented TVM main total rdcycle dump")
+    print("[Fix] Instrumented TVM main inner rdcycle dump")
+
+
+def instrument_llvm_aot_main_total_cycles(output_dir):
+    """Instrument llvm-gemmini shim around tvm_main (LLVM object has no C tvm_main)."""
+    shim_path = output_dir / "codegen" / "host" / "src" / "llvm_aot_shim.c"
+    if not shim_path.exists():
+        raise RuntimeError(f"Missing LLVM AOT shim: {shim_path}")
+
+    content = shim_path.read_text()
+    if TVM_MAIN_INNER_CYCLES_PREFIX in content:
+        return
+
+    include_token = '#include "tvmgen_default.h"\n'
+    if include_token not in content:
+        raise RuntimeError(f"Could not find tvmgen_default include in {shim_path}")
+
+    support_code = _tvm_profile_support_code(inner_cycles_prefix=TVM_MAIN_INNER_CYCLES_PREFIX)
+    updated = content.replace(include_token, include_token + support_code, 1)
+
+    run_fn_re = re.compile(
+        r"int32_t tvmgen_default_run\(\s*"
+        r"struct tvmgen_default_inputs\* inputs,\s*"
+        r"struct tvmgen_default_outputs\* outputs\)\s*\{\s*"
+        r"return tvmgen_default___tvm_main__\(\s*"
+        r"inputs->data,\s*outputs->output,\s*global_const_workspace,\s*global_workspace\);\s*\}",
+        re.DOTALL,
+    )
+    replacement = """int32_t tvmgen_default_run(
+    struct tvmgen_default_inputs* inputs, struct tvmgen_default_outputs* outputs) {
+  uint64_t __tvm_main_profile_start = tvm_profile_read_cycles();
+  int32_t __tvm_main_status = tvmgen_default___tvm_main__(
+      inputs->data, outputs->output, global_const_workspace, global_workspace);
+  tvm_profile_main_cycles = tvm_profile_read_cycles() - __tvm_main_profile_start;
+  tvm_profile_dump_main_cycles();
+  return __tvm_main_status;
+}"""
+    updated, replaced = run_fn_re.subn(replacement, updated, count=1)
+    if replaced != 1:
+        raise RuntimeError("Failed to inject TVM main inner cycle dump into llvm_aot_shim.c")
+
+    shim_path.write_text(updated)
+    print("[Fix] Instrumented llvm-gemmini tvm_main inner rdcycle dump")
 
 
 def _extract_tvm_main_call_names_from_content(content):
@@ -620,6 +960,15 @@ def _build_standalone_layer_ranges(call_names, model_name, debug_unit):
             return [
                 {
                     "layer": f"stage{int(stage_block_match.group(1))}_block{int(stage_block_match.group(2))}",
+                    "start_call": 1,
+                    "end_call": len(call_names),
+                }
+            ]
+        downsample_match = re.match(r"^only_stage(\d+)_downsample$", debug_unit)
+        if downsample_match:
+            return [
+                {
+                    "layer": f"stage{int(downsample_match.group(1))}_downsample",
                     "start_call": 1,
                     "end_call": len(call_names),
                 }
@@ -1002,7 +1351,7 @@ static void tvm_profile_dump_semantic_cycles(void) {{
 }}
 
 static void tvm_profile_dump_main_cycles(void) {{
-  tvm_profile_print_str("[TVM_MAIN_TOTAL_CYCLES],");
+  tvm_profile_print_str("{inner_cycles_prefix}");
   tvm_profile_print_dec(tvm_profile_main_cycles);
   tvm_profile_print_str("\\n");
 }}
@@ -1020,6 +1369,7 @@ static void tvm_profile_dump_main_cycles(void) {{
         component_filter_initializer=_c_string_array_initializer(component_filters),
         layer_filter_count=layer_filter_count,
         component_filter_count=component_filter_count,
+        inner_cycles_prefix=TVM_MAIN_INNER_CYCLES_PREFIX,
     )
     updated = updated.replace(
         '#include "tvm/runtime/c_runtime_api.h"\n',
@@ -1233,7 +1583,7 @@ static void tvm_profile_dump_semantic_cycles(void) {{
 }}
 
 static void tvm_profile_dump_main_cycles(void) {{
-  tvm_profile_print_str("[TVM_MAIN_TOTAL_CYCLES],");
+  tvm_profile_print_str("{inner_cycles_prefix}");
   tvm_profile_print_dec(tvm_profile_main_cycles);
   tvm_profile_print_str("\\n");
 }}
@@ -1247,6 +1597,7 @@ static void tvm_profile_dump_main_cycles(void) {{
         segment_component_initializer=segment_component_initializer,
         segment_start_initializer=segment_start_initializer,
         segment_end_initializer=segment_end_initializer,
+        inner_cycles_prefix=TVM_MAIN_INNER_CYCLES_PREFIX,
     )
     updated = updated.replace(
         '#include "tvm/runtime/c_runtime_api.h"\n',
@@ -1539,11 +1890,17 @@ def fix_generated_code(
     segment_profile_component_filters=None,
     instrument_requant_intrakernel=False,
     debug_unit=None,
+    skip_if_no_scalar_c=False,
+    llvm_gemmini=False,
 ):
     """Apply generated TVM source fixes and optional TVM rdcycle instrumentation."""
+    lib0_path = output_dir / "codegen" / "host" / "src" / "default_lib0.c"
+    if skip_if_no_scalar_c and not lib0_path.exists():
+        print("[Info] llvm-gemmini backend: skipping scalar C codegen fixes")
+        return
+
     if instrument_kernel_cycles or segment_profile_style is not None or instrument_requant_intrakernel:
         _restore_codegen_from_model_tar(output_dir)
-    lib0_path = output_dir / "codegen" / "host" / "src" / "default_lib0.c"
 
     with open(lib0_path, "r") as f:
         content = f.read()
@@ -1556,6 +1913,11 @@ def fix_generated_code(
         with open(lib0_path, "w") as f:
             f.write(content)
         print("[Fix] Applied pointer type fix to generated code")
+
+    if model_name.startswith("swin_") and not llvm_gemmini:
+        # c-gemmini emits a giant C tvm_main that can overflow R_RISCV_JAL; split it.
+        # llvm-gemmini emits tvm_main into an LLVM object (default_lib1.o), so no split.
+        split_oversized_tvm_main_for_riscv_link(output_dir)
 
     if instrument_kernel_cycles:
         _instrument_spike_kernel_cycles(output_dir, model_name)
@@ -1621,17 +1983,46 @@ def extract_spike_semantic_cycle_rows(stdout):
 
 
 def extract_spike_main_total_cycles(stdout):
+    total_cycles = None
     for line in stdout.splitlines():
-        if not line.startswith("[TVM_MAIN_TOTAL_CYCLES],"):
+        if not line.startswith(TVM_MAIN_TOTAL_CYCLES_PREFIX):
             continue
         parts = line.strip().split(",", 1)
         if len(parts) != 2:
             continue
         try:
-            return int(parts[1])
+            total_cycles = int(parts[1])
+        except ValueError:
+            return None
+    if total_cycles is not None:
+        return total_cycles
+
+    for line in stdout.splitlines():
+        if not line.startswith("[TVM_RUN_RESULT],"):
+            continue
+        parts = line.strip().split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            return int(parts[3])
         except ValueError:
             return None
     return None
+
+
+def extract_spike_main_inner_cycles(stdout):
+    inner_cycles = None
+    for line in stdout.splitlines():
+        if not line.startswith(TVM_MAIN_INNER_CYCLES_PREFIX):
+            continue
+        parts = line.strip().split(",", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            inner_cycles = int(parts[1])
+        except ValueError:
+            return None
+    return inner_cycles
 
 
 def extract_spike_intrakernel_cycle_rows(stdout):
@@ -1686,8 +2077,13 @@ def _layernorm_sequence_length(call_names, start_index):
 
     if start_index + 3 < len(call_names) and (
         _matches_generated_name(call_names[start_index], "tvmgen_default_fused_cast_mean")
-        and _matches_generated_name(
-            call_names[start_index + 1], "tvmgen_default_fused_round_cast_subtract"
+        and (
+            _matches_generated_name(
+                call_names[start_index + 1], "tvmgen_default_fused_round_cast_subtract"
+            )
+            or _matches_generated_name(
+                call_names[start_index + 1], "tvmgen_default_fused_cast_round_cast_subtract"
+            )
         )
         and _matches_generated_name(
             call_names[start_index + 2], "tvmgen_default_fused_multiply_sum"
@@ -1701,8 +2097,13 @@ def _layernorm_sequence_length(call_names, start_index):
         and _matches_generated_name(
             call_names[start_index + 1], "tvmgen_default_fused_cast_mean"
         )
-        and _matches_generated_name(
-            call_names[start_index + 2], "tvmgen_default_fused_round_cast_subtract"
+        and (
+            _matches_generated_name(
+                call_names[start_index + 2], "tvmgen_default_fused_round_cast_subtract"
+            )
+            or _matches_generated_name(
+                call_names[start_index + 2], "tvmgen_default_fused_cast_round_cast_subtract"
+            )
         )
         and _matches_generated_name(
             call_names[start_index + 3], "tvmgen_default_fused_multiply_sum"
@@ -1769,7 +2170,37 @@ def _is_dense_head_kernel(name):
 
 
 def _find_head_start(call_names, search_from):
-    for idx in range(max(0, search_from - 1), len(call_names) - 3):
+    search_start = max(0, search_from - 1)
+
+    # Prefer the last layernorm+dense tail in the graph. This avoids treating
+    # the final block's norm2+MLP as the classifier head in DeiT-like graphs.
+    for idx in range(len(call_names) - 4, search_start - 1, -1):
+        ln_len = _layernorm_sequence_length(call_names, idx)
+        if ln_len == 0:
+            continue
+
+        dense_idx = None
+        for probe in range(idx + ln_len, min(len(call_names), idx + ln_len + 16)):
+            if _is_dense_head_kernel(call_names[probe]):
+                dense_idx = probe
+                break
+        if dense_idx is None:
+            continue
+        if any(
+            _is_qkv_split_kernel(call_names[probe])
+            for probe in range(idx + ln_len, min(len(call_names), dense_idx + 8))
+        ):
+            continue
+        if any(
+            call_names[probe].startswith("tvmgen_default_fused_nn_softmax")
+            for probe in range(idx + ln_len, dense_idx)
+        ):
+            continue
+        if _find_next_layernorm_start(call_names, dense_idx + 1) is not None:
+            continue
+        return idx + 1
+
+    for idx in range(search_start, len(call_names) - 3):
         ln_len = _layernorm_sequence_length(call_names, idx)
         if ln_len == 0:
             continue
@@ -1781,7 +2212,7 @@ def _find_head_start(call_names, search_from):
             continue
 
         dense_idx = None
-        for probe in range(idx + ln_len, min(len(call_names), idx + ln_len + 12)):
+        for probe in range(idx + ln_len, min(len(call_names), idx + ln_len + 16)):
             if _is_dense_head_kernel(call_names[probe]):
                 dense_idx = probe
                 break
@@ -1792,14 +2223,6 @@ def _find_head_start(call_names, search_from):
             for probe in range(idx + ln_len, dense_idx)
         ):
             continue
-        softmax_probe = min(len(call_names), dense_idx + 4)
-        if any(
-            call_names[probe] == "tvmgen_default_fused_nn_softmax"
-            for probe in range(dense_idx + 1, softmax_probe)
-        ):
-            return idx + 1
-        if dense_idx == len(call_names) - 1:
-            return idx + 1
         return idx + 1
 
     raise RuntimeError("Could not infer TVM head start from generated call order")
@@ -1824,58 +2247,6 @@ def _build_deit_layer_ranges(call_names):
         block_starts.append(idx + 1)
 
     if not block_starts:
-        # Some recent I-ViT TVM builds fuse the layernorm prelude into generic
-        # fixed-point kernels, so the original layernorm-sequence matcher stops
-        # seeing clear block starts. In that case, the exported operator order
-        # still follows a stable pattern:
-        #   patch_embed (2 calls) + depth * 24 block calls + head (optional 3 calls)
-        # Use that regularity as a fallback so semantic profiling keeps working.
-        expected_depth = MODEL_SPECS["deit_tiny_patch16_224"]["depth"]
-        block_span = 24
-        head_size = 0
-        if (
-            len(call_names) >= 3
-            and call_names[-3].startswith("tvmgen_default_fused_cast_sum")
-            and _is_gemm_kernel(call_names[-2])
-            and _is_gemm_kernel(call_names[-1])
-        ):
-            head_size = 3
-        prefix_calls = len(call_names) - expected_depth * block_span - head_size
-        # Only trust this fallback when the unmatched prefix is tiny. If the
-        # generated call trace is much longer than the operator-function order
-        # (for example because helper/runtime calls are mixed in), this
-        # heuristic would smear huge ranges over patch_embed and must not fire.
-        if 0 <= prefix_calls <= 8:
-            block_starts = [
-                prefix_calls + 1 + block_idx * block_span
-                for block_idx in range(expected_depth)
-            ]
-            head_start = (
-                prefix_calls + expected_depth * block_span + 1 if head_size else None
-            )
-            ranges = []
-            if prefix_calls > 0:
-                ranges.append(
-                    {"layer": "patch_embed", "start_call": 1, "end_call": prefix_calls}
-                )
-            for block_idx, start_call in enumerate(block_starts):
-                end_call = (
-                    block_starts[block_idx + 1] - 1
-                    if block_idx + 1 < len(block_starts)
-                    else (head_start - 1 if head_start is not None else len(call_names))
-                )
-                ranges.append(
-                    {
-                        "layer": f"block_{block_idx}",
-                        "start_call": start_call,
-                        "end_call": end_call,
-                    }
-                )
-            if head_start is not None:
-                ranges.append(
-                    {"layer": "head", "start_call": head_start, "end_call": len(call_names)}
-                )
-            return ranges
         raise RuntimeError(
             f"Expected at least one DeiT block start, found {len(block_starts)}: {block_starts}"
         )
@@ -3445,7 +3816,24 @@ int putchar(int ch) {
 int printf(const char* fmt, ...) { printstr(fmt); return 0; }
 int sprintf(char* str, const char* fmt, ...) { strcpy(str, fmt); return strlen(str); }
 
+static void print_hex64(uintptr_t v) {
+    char buf[19];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 0; i < 16; i++) {
+        int nib = (v >> ((15 - i) * 4)) & 0xf;
+        buf[2 + i] = nib < 10 ? '0' + nib : 'a' + nib - 10;
+    }
+    buf[18] = 0;
+    printstr(buf);
+}
+
 uintptr_t __attribute__((weak)) handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
+    uintptr_t tval;
+    asm volatile("csrr %0, mtval" : "=r"(tval));
+    printstr("\\nTRAP mcause="); print_hex64(cause);
+    printstr(" mepc="); print_hex64(epc);
+    printstr(" mtval="); print_hex64(tval);
+    printstr("\\n");
     tohost_exit(1337);
 }
 """
@@ -3461,7 +3849,7 @@ def fix_gemmini_includes(output_dir):
     import re
 
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    tvm_home = os.environ.get("TVM_HOME", str(DEFAULT_TVM_HOME))
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
     gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
     gemmini_include = pathlib.Path(gemmini_rocc_tests) / "include"
 
@@ -3519,13 +3907,16 @@ typedef int32_t TVMArrayHandle;
 #define TVM_RUNTIME_C_BACKEND_API_H_
 #include <stdint.h>
 #include <stddef.h>
+#include "tvmgen_default.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 #ifndef TVM_DLL
 #define TVM_DLL
 #endif
-static char __tvm_workspace[16 * 1024 * 1024];
+#define TVM_BACKEND_WORKSPACE_SIZE \
+    (TVMGEN_DEFAULT_WORKSPACE_SIZE + (64 * 1024 * 1024))
+static char __tvm_workspace[TVM_BACKEND_WORKSPACE_SIZE];
 static size_t __tvm_workspace_offset = 0;
 static inline void* TVMBackendAllocWorkspace(int device_type, int device_id,
                                               uint64_t nbytes, int dtype_code_hint,
@@ -3546,19 +3937,234 @@ static inline int TVMBackendFreeWorkspace(int device_type, int device_id, void* 
     return stub_dir
 
 
-def compile_for_spike(output_dir, test_name="ivit_real"):
-    """Compile for Spike."""
+def _ndarray_byte_size(ndarr):
+    dtype = ndarr.dtype
+    if isinstance(dtype, str):
+        match = re.match(r"^(?:float|int|uint)(?P<bits>\d+)$", dtype)
+        if not match:
+            raise RuntimeError(f"Unsupported ndarray dtype string: {dtype}")
+        bits = int(match.group("bits"))
+        lanes = 1
+    else:
+        bits = dtype.bits
+        lanes = dtype.lanes
+    elem_bytes = (bits * lanes + 7) // 8
+    size = 1
+    for dim in ndarr.shape:
+        size *= int(dim)
+    return size * elem_bytes
+
+
+def _accumulate_constant_pool_bytes(pool_info):
+    const_infos = sorted(pool_info.constant_info_array, key=lambda ci: int(ci.byte_offset))
+    if not const_infos:
+        return b""
+    total = int(const_infos[-1].byte_offset) + _ndarray_byte_size(const_infos[-1].data)
+    blob = bytearray(total)
+    for ci in const_infos:
+        off = int(ci.byte_offset)
+        arr = ci.data.asnumpy().tobytes()
+        blob[off : off + len(arr)] = arr
+    return bytes(blob)
+
+
+def _format_c_byte_array(data_bytes, indent="    ", line_width=16):
+    if not data_bytes:
+        return indent + "0x00"
+    lines = []
+    row = indent
+    for i, byte_val in enumerate(data_bytes):
+        token = f"0x{byte_val:02x}"
+        if i % line_width == 0:
+            if i > 0:
+                lines.append(row.rstrip() + ",")
+            row = indent + token
+        else:
+            row += ", " + token
+    if row.strip():
+        lines.append(row.rstrip())
+    return "\n".join(lines)
+
+
+def generate_llvm_aot_shim(output_dir, module):
+    """Emit constants/workspace shim + tvmgen_default_run for LLVM AOT objects."""
+    const_blob = b""
+    workspace_size = None
+    for allocated in dict(module.executor_codegen_metadata.pool_inputs).values():
+        pool_info = allocated.pool_info
+        if isinstance(pool_info, ConstantPoolInfo):
+            const_blob = _accumulate_constant_pool_bytes(pool_info)
+        elif pool_info.pool_name == "global_workspace":
+            workspace_size = int(allocated.allocated_size)
+
+    if workspace_size is None:
+        header_path = output_dir / "codegen" / "host" / "include" / "tvmgen_default.h"
+        match = re.search(
+            r"TVMGEN_DEFAULT_WORKSPACE_SIZE\s+(\d+)", header_path.read_text()
+        )
+        if not match:
+            raise RuntimeError(f"Could not determine workspace size from {header_path}")
+        workspace_size = int(match.group(1))
+
+    shim_dir = output_dir / "codegen" / "host" / "src"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim_path = shim_dir / "llvm_aot_shim.c"
+    const_init = _format_c_byte_array(const_blob)
+    shim_source = f"""#include <stdint.h>
+#include "tvm/runtime/c_runtime_api.h"
+#include "tvmgen_default.h"
+
+#ifdef __cplusplus
+extern "C" {{
+#endif
+
+__attribute__((section(".rodata.tvm"), aligned(16)))
+static uint8_t global_const_workspace[{len(const_blob)}] = {{
+{const_init}
+}};
+
+__attribute__((section(".bss.noinit.tvm"), aligned(16)))
+static uint8_t global_workspace[{workspace_size}];
+
+TVM_DLL int32_t tvmgen_default___tvm_main__(
+    void* data, void* output0, uint8_t* global_const_workspace_0_var,
+    uint8_t* global_workspace_1_var);
+
+int32_t tvmgen_default_run(
+    struct tvmgen_default_inputs* inputs, struct tvmgen_default_outputs* outputs) {{
+  return tvmgen_default___tvm_main__(
+      inputs->data, outputs->output, global_const_workspace, global_workspace);
+}}
+
+#ifdef __cplusplus
+}}
+#endif
+"""
+    shim_path.write_text(shim_source)
+    print(
+        f"[Info] Generated LLVM AOT shim: {shim_path} "
+        f"(constants={len(const_blob)} bytes, workspace={workspace_size} bytes)"
+    )
+    return shim_path
+
+
+def count_rvv_instructions(output_dir, *, object_name="default_lib1.o"):
+    """Count RVV instructions in a precompiled LLVM object via objdump."""
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
+    objdump = f"{riscv}/bin/riscv64-unknown-elf-objdump"
+    obj_path = output_dir / "codegen" / "host" / "lib" / object_name
+    if not obj_path.exists():
+        print(f"[WARN] RVV check skipped; object not found: {obj_path}")
+        return 0
+
+    result = subprocess.run([objdump, "-d", str(obj_path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"[WARN] objdump failed for {obj_path}: {result.stderr}")
+        return 0
+
+    rvv_mnemonics = (
+        "vsetvli",
+        "vsetivli",
+        "vle",
+        "vse",
+        "vlse",
+        "vsse",
+        "vluxei",
+        "vsuxei",
+        "vadd",
+        "vsub",
+        "vmul",
+        "vdiv",
+        "vfadd",
+        "vfsub",
+        "vfmul",
+        "vfmacc",
+        "vfnmacc",
+        "vmacc",
+        "vnmsac",
+        "vslide",
+        "vmv",
+        "vmfeq",
+        "vmfne",
+        "vmfgt",
+        "vmfge",
+        "vmflt",
+        "vmfle",
+        "vmerge",
+        "vmand",
+        "vmor",
+        "vmxor",
+        "vmsbc",
+        "vadc",
+        "vcompress",
+        "viota",
+        "vid",
+        "vrgather",
+        "vred",
+        "vwred",
+        "vfred",
+        "vfwred",
+        "vcpop",
+        "vfirst",
+        "vmsbf",
+        "vmsif",
+        "vmsof",
+        "viota.m",
+        "vssrl",
+        "vssra",
+        "vnclip",
+        "vnclipu",
+    )
+    pattern = re.compile(r"\b(" + "|".join(re.escape(m) for m in rvv_mnemonics) + r")\b")
+    count = 0
+    samples = []
+    for line in result.stdout.splitlines():
+        if pattern.search(line):
+            count += 1
+            if len(samples) < 8:
+                samples.append(line.strip())
+    print(f"[RVV] {object_name}: {count} vector instructions")
+    vlenb_hits = [line.strip() for line in result.stdout.splitlines() if "vlenb" in line]
+    if vlenb_hits:
+        print(f"[WARN] {object_name}: {len(vlenb_hits)} csrr vlenb (Spike 1.1.x may trap)")
+        for sample in vlenb_hits[:4]:
+            print(f"       {sample}")
+    else:
+        print(f"[RVV] {object_name}: no csrr vlenb (fixed VLEN, Spike-safe)")
+    for sample in samples:
+        print(f"       {sample}")
+    return count
+
+
+def compile_for_spike_llvm_gemmini(
+    output_dir,
+    test_name="ivit_real",
+    *,
+    riscv_march="rv64gc",
+    gcc_opt_level=2,
+):
+    """Link precompiled LLVM host objects + Gemmini C sources for Spike."""
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    tvm_home = os.environ.get("TVM_HOME", str(DEFAULT_TVM_HOME))
-    riscv = os.environ.get("RISCV", str(DEFAULT_RISCV_DIR))
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
 
     gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
     riscv_tests = f"{gemmini_rocc_tests}/riscv-tests"
     bench_common = f"{riscv_tests}/benchmarks/common"
-
     cc = f"{riscv}/bin/riscv64-unknown-elf-gcc"
 
     codegen_dir = output_dir / "codegen" / "host"
+    lib_dir = codegen_dir / "lib"
+    llvm_objects = sorted(lib_dir.glob("*.o"))
+    if not llvm_objects:
+        print(f"[ERROR] No LLVM objects found under {lib_dir}")
+        return None
+
+    shim_path = codegen_dir / "src" / "llvm_aot_shim.c"
+    if not shim_path.exists():
+        print(f"[ERROR] Missing LLVM AOT shim: {shim_path}")
+        return None
+
     fixed_include = fix_gemmini_includes(output_dir)
     create_tvm_stubs(output_dir)
     fixed_syscalls_dir = create_errno_stub(output_dir)
@@ -3568,14 +4174,16 @@ def compile_for_spike(output_dir, test_name="ivit_real"):
         "-DMULTITHREAD=1",
         "-mcmodel=medany",
         "-std=gnu99",
-        "-O2",
+        f"-O{gcc_opt_level}",
         "-ffast-math",
         "-fno-common",
         "-fno-builtin-printf",
         "-fno-builtin-memset",
         "-fno-builtin-memcpy",
         "-fno-tree-loop-distribute-patterns",
-        "-march=rv64gc",
+        f"-march={riscv_march}",
+        "-mabi=lp64d",
+        "-mrelax",
         "-nostdlib",
         "-nostartfiles",
         "-static",
@@ -3594,16 +4202,140 @@ def compile_for_spike(output_dir, test_name="ivit_real"):
         "-DPRINT_TILE=0",
     ]
 
+    source_files = [str(output_dir / "main.c"), str(shim_path)]
+    source_files.append(str(fixed_syscalls_dir / "syscalls.c"))
+    source_files += [str(f) for f in pathlib.Path(bench_common).glob("*.S")]
+    source_files += [
+        str(f)
+        for f in (codegen_dir / "src").glob("*.c")
+        if f.name != "llvm_aot_shim.c"
+    ]
+
+    build_dir = output_dir / "build"
+    obj_dir = build_dir / "obj"
+    build_dir.mkdir(exist_ok=True)
+    obj_dir.mkdir(exist_ok=True)
+
+    # Place small runtime objects (crt/syscalls/main/gemmini C) FIRST so their
+    # .text (incl. _init) sits close to _start; the huge LLVM object goes LAST.
+    # Otherwise a multi-MB default_lib1.o pushes _init out of crt's `j _init`
+    # (R_RISCV_JAL, +-1MB) range -> "relocation truncated to fit".
+    object_files = []
+    for src in source_files:
+        obj_path = obj_dir / (pathlib.Path(src).stem + ".o")
+        compile_cmd = [cc] + cflags + ["-c", src, "-o", str(obj_path)]
+        compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if compile_result.returncode != 0:
+            print(f"[ERROR] Compilation failed for {src}:")
+            print(compile_result.stderr)
+            return None
+        object_files.append(str(obj_path))
+    object_files += [str(obj) for obj in llvm_objects]
+
+    output_binary = build_dir / f"{test_name}-baremetal"
+    cmd = (
+        [cc]
+        + cflags
+        + object_files
+        + ["-o", str(output_binary), "-lm", "-lgcc", "-Wl,--relax"]
+    )
+    print(f"[Compile] Linking llvm-gemmini Spike binary ({len(llvm_objects)} LLVM objects)...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("[ERROR] llvm-gemmini link failed:")
+        print(result.stderr)
+        return None
+
+    print(f"[OK] Binary: {output_binary}")
+    return output_binary
+
+
+def compile_for_spike(
+    output_dir,
+    test_name="ivit_real",
+    *,
+    riscv_march="rv64gc",
+    gcc_opt_level=2,
+    gcc_autovec=False,
+):
+    """Compile for Spike."""
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
+
+    gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
+    riscv_tests = f"{gemmini_rocc_tests}/riscv-tests"
+    bench_common = f"{riscv_tests}/benchmarks/common"
+
+    cc = f"{riscv}/bin/riscv64-unknown-elf-gcc"
+
+    codegen_dir = output_dir / "codegen" / "host"
+    fixed_include = fix_gemmini_includes(output_dir)
+    create_tvm_stubs(output_dir)
+    fixed_syscalls_dir = create_errno_stub(output_dir)
+
+    cflags = [
+        "-DPREALLOCATE=1",
+        "-DMULTITHREAD=1",
+        "-mcmodel=medany",
+        "-std=gnu99",
+        f"-O{gcc_opt_level}",
+        "-ffast-math",
+        "-fno-common",
+        "-fno-builtin-printf",
+        "-fno-builtin-memset",
+        "-fno-builtin-memcpy",
+        "-fno-tree-loop-distribute-patterns",
+        f"-march={riscv_march}",
+        "-mrelax",
+        "-nostdlib",
+        "-nostartfiles",
+        "-static",
+        f"-T{bench_common}/test.ld",
+        "-DBAREMETAL=1",
+        "-DTVM_RUNTIME_ALLOC",
+        f"-I{riscv_tests}",
+        f"-I{riscv_tests}/env",
+        f"-I{fixed_include}",
+        f"-I{gemmini_rocc_tests}",
+        f"-I{gemmini_rocc_tests}/include",
+        f"-I{bench_common}",
+        f"-I{codegen_dir}/src",
+        f"-I{codegen_dir}/include",
+        f"-I{output_dir}/tvm_stubs",
+        "-DPRINT_TILE=0",
+    ]
+    if gcc_autovec:
+        cflags.append("-ftree-vectorize")
+
     source_files = [str(output_dir / "main.c")]
     source_files += [str(fixed_syscalls_dir / "syscalls.c")]
     source_files += [str(f) for f in pathlib.Path(bench_common).glob("*.S")]
     source_files += [str(f) for f in (codegen_dir / "src").glob("*.c")]
 
     build_dir = output_dir / "build"
+    obj_dir = build_dir / "obj"
     build_dir.mkdir(exist_ok=True)
+    obj_dir.mkdir(exist_ok=True)
     output_binary = build_dir / f"{test_name}-baremetal"
 
-    cmd = [cc] + cflags + source_files + ["-o", str(output_binary), "-lm", "-lgcc"]
+    object_files = []
+    for src in source_files:
+        obj_path = obj_dir / (pathlib.Path(src).stem + ".o")
+        compile_cmd = [cc] + cflags + ["-c", src, "-o", str(obj_path)]
+        compile_result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if compile_result.returncode != 0:
+            print(f"[ERROR] Compilation failed for {src}:")
+            print(compile_result.stderr)
+            return None
+        object_files.append(str(obj_path))
+
+    cmd = (
+        [cc]
+        + cflags
+        + object_files
+        + ["-o", str(output_binary), "-lm", "-lgcc", "-Wl,--relax"]
+    )
 
     print(f"[Compile] Building {test_name}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -3617,18 +4349,21 @@ def compile_for_spike(output_dir, test_name="ivit_real"):
     return output_binary
 
 
-def run_spike(binary_path, timeout=600):
+def run_spike(binary_path, timeout=600, spike_isa=None):
     """Run on Spike."""
-    riscv = os.environ.get("RISCV", str(DEFAULT_RISCV_DIR))
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
     spike = f"{riscv}/bin/spike"
-    chipyard_lib = str(DEFAULT_CHIPYARD_DIR / ".conda-env" / "lib")
+    chipyard_lib = "/root/flexi/chipyard/.conda-env/lib"
 
     env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = f"{chipyard_lib}:{env.get('LD_LIBRARY_PATH', '')}"
     if "LD_PRELOAD" in env:
         del env["LD_PRELOAD"]
 
-    cmd = [spike, "--extension=gemmini", str(binary_path)]
+    cmd = [spike]
+    if spike_isa:
+        cmd.append(f"--isa={spike_isa}")
+    cmd.extend(["--extension=gemmini", str(binary_path)])
 
     print(f"\n[Spike] Running inference...")
     timeout_arg = timeout if timeout and timeout > 0 else None
@@ -3648,7 +4383,7 @@ def run_spike(binary_path, timeout=600):
 def run_verilator(
     binary_path,
     timeout=600,
-    chipyard_dir=str(DEFAULT_CHIPYARD_DIR),
+    chipyard_dir="/root/flexi/chipyard",
     verilator_config="BigRocketSaturnGemminiConfig",
     max_cycles=20000000000,
     dramsim=True,
@@ -3772,7 +4507,7 @@ def run_verilator(
 
 
 def _resolve_riscv_tool(tool_name):
-    riscv = os.environ.get("RISCV", str(DEFAULT_RISCV_DIR))
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
     return pathlib.Path(riscv) / "bin" / tool_name
 
 
@@ -3901,17 +4636,31 @@ def main():
         "--checkpoint", type=str, default="/root/checkpoint_last.pth.tar"
     )
     parser.add_argument(
+        "--allow-random-init",
+        action="store_true",
+        help="Use a random initialized QAT state_dict when --checkpoint is absent.",
+    )
+    parser.add_argument(
         "--model-name",
         type=str,
         default="auto",
-        choices=["auto", "deit_tiny_patch16_224", "swin_tiny_patch4_window7_224"],
+        choices=[
+            "auto",
+            "deit_tiny_patch16_224",
+            "deit_small_patch16_224",
+            "fq_deit_tiny_patch16_224",
+            "ptq4_deit_tiny_patch16_224",
+            "ptq4_deit_small_patch16_224",
+            "swin_tiny_patch4_window7_224",
+            "swin_small_patch4_window7_224",
+        ],
         help="Model name (auto detects from checkpoint keys)",
     )
     parser.add_argument("--output-dir", type=str, default="ivit_real_image_project")
     parser.add_argument(
         "--timeout",
         type=int,
-        default=600,
+        default=0,
         help="Host-side timeout in seconds (0 to disable)",
     )
     parser.add_argument(
@@ -3924,7 +4673,7 @@ def main():
     parser.add_argument(
         "--chipyard-dir",
         type=str,
-        default=str(DEFAULT_CHIPYARD_DIR),
+        default="/root/flexi/chipyard",
         help="Chipyard root path (used for Verilator)",
     )
     parser.add_argument(
@@ -3950,8 +4699,73 @@ def main():
         default=None,
         help=(
             "Relay debug cut point (e.g. post_block0, block_0_pre_softmax, "
-            "post_stage0_block0, post_stem, pre_head, head_int)"
+            "post_stage0_block0, only_stage0_block0, only_stage0_downsample, "
+            "post_stem, pre_head, head_int)"
         ),
+    )
+    parser.add_argument(
+        "--tvm-backend",
+        type=str,
+        default="c-gemmini",
+        choices=["c-gemmini", "llvm-gemmini"],
+        help=(
+            "TVM codegen backend: c-gemmini (default scalar C) or "
+            "llvm-gemmini (Path B heterogeneous LLVM CPU + Gemmini BYOC)"
+        ),
+    )
+    parser.add_argument(
+        "--llvm-tir-vectorize",
+        action="store_true",
+        help=(
+            "With --tvm-backend llvm-gemmini: enable TIR VectorizeLoop "
+            "(TE split+vectorize / Case A) instead of LLVM-only autovec (Case B)."
+        ),
+    )
+    parser.add_argument(
+        "--llvm-rvv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable RVV (+v,+zvl512b) LLVM autovec on host epilogues (llvm-gemmini; Saturn/FireSim)",
+    )
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Stop after exporting and compiling the baremetal ELF.",
+    )
+    parser.add_argument(
+        "--riscv-march",
+        type=str,
+        default="rv64gc",
+        help="RISC-V march for gcc link/compile (e.g. rv64gc, rv64gcv for Path A autovec)",
+    )
+    parser.add_argument(
+        "--gcc-opt-level",
+        type=int,
+        default=2,
+        choices=[0, 1, 2, 3],
+        help="gcc optimization level for baremetal link",
+    )
+    parser.add_argument(
+        "--gcc-autovec",
+        action="store_true",
+        help="Enable gcc -ftree-vectorize (Path A: scalar C + RVV autovec)",
+    )
+    parser.add_argument(
+        "--spike-isa",
+        type=str,
+        default=None,
+        help="Spike --isa string (default: --riscv-march when it contains 'v')",
+    )
+    parser.add_argument(
+        "--force-synthetic-input",
+        action="store_true",
+        help="Use deterministic synthetic input even for image-shaped model inputs.",
+    )
+    parser.add_argument(
+        "--synthetic-seed",
+        type=int,
+        default=0,
+        help="Seed for deterministic synthetic input generation.",
     )
     parser.add_argument(
         "--verilator-verbose",
@@ -4075,9 +4889,6 @@ def main():
         return 1
 
     image_path = pathlib.Path(args.image)
-    if not image_path.exists():
-        print(f"[ERROR] Image not found: {image_path}")
-        return 1
 
     print("=" * 60)
     print("I-ViT Real Image Inference on Gemmini")
@@ -4097,49 +4908,137 @@ def main():
 
     print("\n[1/6] Loading checkpoint...")
     checkpoint_path = pathlib.Path(args.checkpoint).expanduser()
-    if not checkpoint_path.exists():
+    requested_model_name = None if args.model_name == "auto" else args.model_name
+    if (
+        not checkpoint_path.exists()
+        and not args.allow_random_init
+        and not (requested_model_name and requested_model_name.startswith("ptq4_deit_"))
+    ):
         print(f"[ERROR] Checkpoint not found: {checkpoint_path}")
         return 1
 
-    ckpt = torch.load(str(checkpoint_path), map_location="cpu")
-    if (
-        isinstance(ckpt, dict)
-        and "model" in ckpt
-        and isinstance(ckpt["model"], dict)
-        and "qact_input.act_scaling_factor" not in ckpt
-    ):
-        ckpt = ckpt["model"]
-    requested_model_name = None if args.model_name == "auto" else args.model_name
-    model_name = convert_model.resolve_model_name(ckpt, requested_model_name)
-    if model_name not in MODEL_SPECS:
+    # PTQ4 uses flexi e2e_model.pt (not I-ViT qconfig checkpoint).
+    if requested_model_name and requested_model_name.startswith("ptq4_deit_"):
+        model_name = requested_model_name
+        ckpt = None
+        print(f"       Model: {model_name} (PTQ4 flexi checkpoint via get_workload)")
+        if model_name not in MODEL_SPECS:
+            print(f"[ERROR] Unsupported model for this runner: {model_name}")
+            return 1
+        depth = MODEL_SPECS[model_name]["depth"]
+        input_scale = None
+        print("\n[2/6] Preparing model input...")
+        mod, params = get_workload(model_name, batch_size=1, debug_unit=args.debug_unit)
+        mod = relay.transform.InferType()(mod)
+        input_spec = _extract_main_input_spec(mod)
+        if (
+            not args.force_synthetic_input
+            and tuple(input_spec["shape"]) == (1, 3, 224, 224)
+            and input_spec["dtype"] == "float32"
+            and not image_path.exists()
+            and not args.force_synthetic_input
+        ):
+            # Prefer flexi golden input when image missing
+            from models.ivit.ptq4_checkpoint import DEFAULT_PTQ4_DEIT_T_INPUT
+            if model_name.endswith("_tiny_patch16_224") and DEFAULT_PTQ4_DEIT_T_INPUT.is_file():
+                input_data = np.fromfile(DEFAULT_PTQ4_DEIT_T_INPUT, dtype="<f4").reshape(1, 3, 224, 224)
+                input_mode = "flexi_golden_f32"
+            else:
+                input_data, input_mode = prepare_input_data(
+                    image_path,
+                    input_scale,
+                    input_spec,
+                    force_synthetic=True,
+                    model_name=model_name,
+                )
+        else:
+            if (
+                not args.force_synthetic_input
+                and tuple(input_spec["shape"]) == (1, 3, 224, 224)
+                and input_spec["dtype"] == "float32"
+                and not image_path.exists()
+            ):
+                print(f"[ERROR] Image not found: {image_path}")
+                return 1
+            input_data, input_mode = prepare_input_data(
+                image_path,
+                input_scale,
+                input_spec,
+                force_synthetic=args.force_synthetic_input,
+                model_name=model_name,
+            )
+        print(f"       Input mode: {input_mode}")
+        print(f"       Input tensor shape: {input_data.shape}, dtype: {input_data.dtype}")
+        # Jump into shared build path by setting flags used below — fall through via goto-like structure.
+        # We set variables expected after the common input-prep block.
+        skip_common_load = True
+    else:
+        skip_common_load = False
+
+    if not skip_common_load:
+      if checkpoint_path.exists():
+        ckpt = torch.load(str(checkpoint_path), map_location="cpu")
+        model_name = convert_model.resolve_model_name(ckpt, requested_model_name)
+      else:
+        if requested_model_name is None:
+            print("[ERROR] --model-name is required with --allow-random-init when checkpoint is absent")
+            return 1
+        model_name = requested_model_name
+        print(f"       [WARN] Using random-initialized state for {model_name}")
+        ckpt = build_random_qat_state_dict(model_name)
+      if model_name not in MODEL_SPECS:
         print(f"[ERROR] Unsupported model for this runner: {model_name}")
         return 1
 
-    depth = MODEL_SPECS[model_name]["depth"]
-    convert_model.load_qconfig(ckpt, depth=depth, model_name=model_name)
-    print(f"       Checkpoint: {checkpoint_path}")
-    print(f"       Model: {model_name}")
+      depth = MODEL_SPECS[model_name]["depth"]
+      convert_model.load_qconfig(ckpt, depth=depth, model_name=model_name)
+      print(f"       Checkpoint: {checkpoint_path if checkpoint_path.exists() else '<random-init>'}")
+      print(f"       Model: {model_name}")
 
-    input_scale = ckpt["qact_input.act_scaling_factor"].item()
-    print(f"       Input quantization scale: {input_scale}")
+      input_scale = None
+      if model_name.startswith("fq_deit_"):
+        input_scale = ckpt["qact_input.scale"].item()
+        print(f"       FQ input scale (qact_input.scale): {input_scale}")
+      else:
+        input_scale = ckpt["qact_input.act_scaling_factor"].item()
+        print(f"       Input quantization scale: {input_scale}")
 
-    print("\n[2/6] Preparing model input...")
-    mod, _ = get_workload(model_name, batch_size=1, debug_unit=args.debug_unit)
-    mod = relay.transform.InferType()(mod)
-    input_spec = _extract_main_input_spec(mod)
-    input_data, input_mode = prepare_input_data(image_path, input_scale, input_spec)
-    print(f"       Input mode: {input_mode}")
-    print(f"       Input tensor shape: {input_data.shape}, dtype: {input_data.dtype}")
+      print("\n[2/6] Preparing model input...")
+      mod, params = get_workload(model_name, batch_size=1, debug_unit=args.debug_unit)
+      mod = relay.transform.InferType()(mod)
+      input_spec = _extract_main_input_spec(mod)
+      if (
+        not args.force_synthetic_input
+        and _is_real_image_input(input_spec["shape"], input_spec["dtype"])
+        and not image_path.exists()
+      ):
+        print(f"[ERROR] Image not found: {image_path}")
+        return 1
+      input_data, input_mode = prepare_input_data(
+        image_path,
+        input_scale,
+        input_spec,
+        force_synthetic=args.force_synthetic_input,
+        model_name=model_name,
+      )
+      print(f"       Input mode: {input_mode}")
+      print(f"       Input tensor shape: {input_data.shape}, dtype: {input_data.dtype}")
+
     print(f"       Value range: [{input_data.min()}, {input_data.max()}]")
 
     print("\n[3/6] Building TVM model...")
     t_build_start = time.time()
-    params = convert_model.build_param_dict(ckpt, depth=depth, model_name=model_name)
+    if model_name.startswith("ptq4_deit_"):
+        # params already loaded from flexi e2e_model.pt via get_workload()
+        pass
+    else:
+        params = convert_model.build_param_dict(ckpt, depth=depth, model_name=model_name)
 
     tvm_params = {k: tvm.nd.array(v) for k, v in params.items()}
 
     RUNTIME = tvm.relay.backend.Runtime("crt", {"system-lib": False})
-    TARGET = tvm.target.target.Target({"kind": "c", "device": "gemmini"})
+    if args.tvm_backend == "llvm-gemmini":
+        RUNTIME = tvm.relay.backend.Runtime("crt", {"system-lib": True})
     EXECUTOR = tvm.relay.backend.Executor(
         "aot", options={"interface-api": "c", "unpacked-api": 1}
     )
@@ -4157,8 +5056,30 @@ def main():
     ) and not args.disable_qnn_canonicalize
     disabled_passes = ["AlterOpLayout"]
     print(f"       Swin qnn canonicalize: {canonicalize_qnn}")
-    mod = preprocess_for_gemmini(mod, model_name, canonicalize_qnn=canonicalize_qnn)
+    use_llvm_gemmini = args.tvm_backend == "llvm-gemmini"
+    if use_llvm_gemmini:
+        if not gemmini_byoc_enabled():
+            print(
+                "[ERROR] --tvm-backend llvm-gemmini requires Gemmini BYOC target in TVM. "
+                "Rebuild tvm-gemmini with USE_GEMMINI=ON (see docs/tvm_path_b_plan.md)."
+            )
+            return 1
+        print(
+            f"       TVM backend: llvm-gemmini "
+            f"(RVV={args.llvm_rvv}, tir_vectorize={args.llvm_tir_vectorize})"
+        )
+        mod = preprocess_for_heterogeneous_gemmini(
+            mod, model_name, canonicalize_qnn=canonicalize_qnn
+        )
+    else:
+        print("       TVM backend: c-gemmini")
+        mod = preprocess_for_gemmini(mod, model_name, canonicalize_qnn=canonicalize_qnn)
     mod = relay.transform.InferType()(mod)
+    if use_llvm_gemmini:
+        llvm_target = llvm_riscv_target(enable_rvv=args.llvm_rvv)
+        gemmini_target = tvm.target.Target("gemmini", host=llvm_target)
+        mod["main"] = bind_params_by_name(mod["main"], tvm_params)
+        mod = relay.transform.InferType()(mod)
     print("       Preprocess pass done")
     stack_limit_change = maybe_raise_stack_limit_for_build(model_name, opt_level)
     if stack_limit_change is not None:
@@ -4173,12 +5094,30 @@ def main():
     if disabled_passes:
         print(f"       disabled_pass={disabled_passes}")
 
-    with gemmini.build_config(
-        usmp_alg=usmp_alg, opt_level=opt_level, disabled_pass=disabled_passes
-    ):
-        module = relay.build(
-            mod, executor=EXECUTOR, runtime=RUNTIME, target=TARGET, params=tvm_params
+    if use_llvm_gemmini:
+        build_ctx = gemmini.heterogeneous_build_config(
+            usmp_alg=usmp_alg,
+            opt_level=opt_level,
+            disabled_pass=disabled_passes,
+            enable_tir_vectorize=bool(args.llvm_tir_vectorize),
         )
+        build_kwargs = dict(
+            executor=EXECUTOR,
+            runtime=RUNTIME,
+            target=[llvm_target, gemmini_target],
+            params=tvm_params,
+        )
+    else:
+        TARGET = tvm.target.target.Target({"kind": "c", "device": "gemmini"})
+        build_ctx = gemmini.build_config(
+            usmp_alg=usmp_alg, opt_level=opt_level, disabled_pass=disabled_passes
+        )
+        build_kwargs = dict(
+            executor=EXECUTOR, runtime=RUNTIME, target=TARGET, params=tvm_params
+        )
+
+    with build_ctx:
+        module = relay.build(mod, **build_kwargs)
     t_build_end = time.time()
     print(f"       relay.build 완료 ({t_build_end - t_build_start:.1f}s)")
 
@@ -4202,8 +5141,22 @@ def main():
         segment_profile_component_filters=args.profile_component_filter,
         instrument_requant_intrakernel=args.profile_intrakernel_requant,
         debug_unit=args.debug_unit,
+        skip_if_no_scalar_c=use_llvm_gemmini,
+        llvm_gemmini=use_llvm_gemmini,
     )
-    instrument_tvm_main_total_cycles(output_dir)
+    if use_llvm_gemmini:
+        generate_llvm_aot_shim(output_dir, module)
+        instrument_llvm_aot_main_total_cycles(output_dir)
+        count_rvv_instructions(output_dir, object_name="default_lib1.o")
+        if args.build_only:
+            print(
+                "[Info] llvm-gemmini build-only complete. "
+                "LLVM objects: codegen/host/lib/*.o"
+            )
+            return 0
+
+    if not use_llvm_gemmini:
+        instrument_tvm_main_total_cycles(output_dir)
     classification_output = args.debug_unit is None
     create_real_image_harness(
         output_dir,
@@ -4213,16 +5166,64 @@ def main():
         classification_output=classification_output,
         debug_unit=args.debug_unit,
         uart_mode=args.uart_mode,
+        enable_spike_rvv=(
+            (use_llvm_gemmini and args.llvm_rvv)
+            or bool(args.gcc_autovec)
+            or riscv_march_enables_v(args.riscv_march or "")
+        ),
     )
 
     print("\n[5/6] Compiling for Spike...")
-    binary = compile_for_spike(output_dir, "ivit_real")
+    if use_llvm_gemmini:
+        link_march = SATURN_LINK_MARCH if args.llvm_rvv else "rv64gc"
+        compile_label = f"llvm-gemmini march={link_march} O{args.gcc_opt_level}"
+        print(f"[Info] link flags: {compile_label}")
+        binary = compile_for_spike_llvm_gemmini(
+            output_dir,
+            "ivit_real",
+            riscv_march=link_march,
+            gcc_opt_level=args.gcc_opt_level,
+        )
+    else:
+        compile_label = (
+            f"march={args.riscv_march} O{args.gcc_opt_level}"
+            + (" autovec" if args.gcc_autovec else "")
+        )
+        print(f"[Info] gcc flags: {compile_label}")
+        binary = compile_for_spike(
+            output_dir,
+            "ivit_real",
+            riscv_march=args.riscv_march,
+            gcc_opt_level=args.gcc_opt_level,
+            gcc_autovec=args.gcc_autovec,
+        )
     if binary is None:
         return 1
+    if args.build_only:
+        print(f"[Info] Build-only mode. Baremetal ELF: {binary}")
+        return 0
 
     if args.simulator == "spike":
+        spike_isa = args.spike_isa
+        if spike_isa is None and use_llvm_gemmini and args.llvm_rvv:
+            spike_isa = SATURN_SPIKE_ISA
+        elif spike_isa is None and (
+            args.gcc_autovec or riscv_march_enables_v(args.riscv_march or "")
+        ):
+            # Path A: prefer Saturn-complete ISA for local smoke; FireSim uses HW RVV.
+            spike_isa = SATURN_SPIKE_ISA
+        if spike_isa:
+            print(f"[Info] Spike ISA: {spike_isa}")
+        if use_llvm_gemmini and args.llvm_rvv:
+            print(
+                "[Info] llvm-gemmini RVV: fixed VLEN=512 LLVM cl-opt + mstatus.VS for Spike."
+            )
+        elif args.gcc_autovec or riscv_march_enables_v(args.riscv_march or ""):
+            print(
+                "[Info] Path A gcc-autovec: march has V; harness enables mstatus.VS + vill clear."
+            )
         print("\n[6/6] Running on Spike...")
-        stdout, stderr = run_spike(binary, timeout=args.timeout)
+        stdout, stderr = run_spike(binary, timeout=args.timeout, spike_isa=spike_isa)
         ver_stdout_path = None
         ver_stderr_path = None
     else:

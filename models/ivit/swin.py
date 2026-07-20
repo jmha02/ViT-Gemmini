@@ -7,8 +7,10 @@ from . import layers
 
 
 SWIN_TINY_DEPTHS = (2, 2, 6, 2)
+SWIN_SMALL_DEPTHS = (2, 2, 18, 2)
 SWIN_TINY_HEADS = (3, 6, 12, 24)
 _ONLY_SWIN_STAGE_BLOCK_RE = re.compile(r"^only_stage(\d+)_block(\d+)$")
+_ONLY_SWIN_STAGE_DOWNSAMPLE_RE = re.compile(r"^only_stage(\d+)_downsample$")
 _ONLY_SWIN_GLOBAL_BLOCK_RE = re.compile(r"^only_block(\d+)$")
 
 
@@ -43,6 +45,20 @@ def _resolve_only_swin_block(debug_unit, depths):
         running += stage_depth
 
     raise RuntimeError(f"Could not resolve Swin standalone block index: {global_block_idx}")
+
+
+def _resolve_only_swin_downsample(debug_unit, depths):
+    if not debug_unit:
+        return None
+
+    stage_match = _ONLY_SWIN_STAGE_DOWNSAMPLE_RE.match(debug_unit)
+    if not stage_match:
+        return None
+
+    stage_idx = int(stage_match.group(1))
+    if not 0 <= stage_idx < len(depths) - 1:
+        raise RuntimeError(f"Unsupported Swin standalone downsample stage index: {stage_idx}")
+    return stage_idx
 
 
 def _standalone_swin_block_signature(embed_dim, depths, num_heads, window_size, stage_idx, block_idx):
@@ -82,6 +98,39 @@ def _standalone_swin_block_signature(embed_dim, depths, num_heads, window_size, 
 
     raise RuntimeError(
         f"Could not determine Swin standalone signature for stage {stage_idx} block {block_idx}"
+    )
+
+
+def _standalone_swin_downsample_signature(embed_dim, depths, stage_idx):
+    h = 56
+    w = 56
+    dim = embed_dim
+    current_scale = layers.get_qconfig("qconfig_stem").output_scale
+
+    for current_stage_idx, stage_depth in enumerate(depths):
+        for current_block_idx in range(stage_depth):
+            current_scale = layers.get_qconfig(
+                f"stage{current_stage_idx}_block{current_block_idx}_qconfig_add2"
+            ).output_scale
+
+        if current_stage_idx == stage_idx:
+            return {
+                "input_shape": [1, h * w, dim],
+                "dim": dim,
+                "input_resolution": (h, w),
+                "block_input_scale": current_scale,
+            }
+
+        if current_stage_idx < len(depths) - 1:
+            current_scale = layers.get_qconfig(
+                f"stage{current_stage_idx}_downsample_qconfig_out"
+            ).output_scale
+            h //= 2
+            w //= 2
+            dim *= 2
+
+    raise RuntimeError(
+        f"Could not determine Swin standalone downsample signature for stage {stage_idx}"
     )
 
 
@@ -575,6 +624,27 @@ def Q_SwinTransformerTiny(
         )
         return relay.Function(relay.analysis.free_vars(body), body)
 
+    standalone_downsample_stage = _resolve_only_swin_downsample(debug_unit, depths)
+    if standalone_downsample_stage is not None:
+        signature = _standalone_swin_downsample_signature(
+            embed_dim=embed_dim,
+            depths=depths,
+            stage_idx=standalone_downsample_stage,
+        )
+        downsample_input = relay.var(
+            "data",
+            shape=signature["input_shape"],
+            dtype="int8",
+        )
+        body = _patch_merging(
+            downsample_input,
+            name=f"stage{standalone_downsample_stage}_downsample",
+            input_resolution=signature["input_resolution"],
+            dim=signature["dim"],
+            batch_size=batch_size,
+        )
+        return relay.Function(relay.analysis.free_vars(body), body)
+
     if debug_unit in ("only_head", "only_classifier", "classifier_only"):
         final_dim = embed_dim * (2 ** (len(depths) - 1))
         final_hw = 56 // (2 ** (len(depths) - 1))
@@ -790,6 +860,19 @@ def get_swin_tiny_model(data_shape, dtype="int8", debug_unit=None):
         dtype=dtype,
         embed_dim=96,
         depths=SWIN_TINY_DEPTHS,
+        num_heads=SWIN_TINY_HEADS,
+        window_size=7,
+        mlp_ratio=4,
+        debug_unit=debug_unit,
+    )
+
+
+def get_swin_small_model(data_shape, dtype="int8", debug_unit=None):
+    return Q_SwinTransformerTiny(
+        data_shape=data_shape,
+        dtype=dtype,
+        embed_dim=96,
+        depths=SWIN_SMALL_DEPTHS,
         num_heads=SWIN_TINY_HEADS,
         window_size=7,
         mlp_ratio=4,

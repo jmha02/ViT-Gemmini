@@ -4,7 +4,10 @@ Export ONNX models for ONNX Runtime + Gemmini Spike flow.
 
 Supported model names:
   - deit_tiny_patch16_224
+  - deit_small_patch16_224
+  - fq_deit_tiny_patch16_224
   - swin_tiny_patch4_window7_224
+  - swin_small_patch4_window7_224
 """
 
 from __future__ import annotations
@@ -22,9 +25,17 @@ ONNXRT_DIR = SCRIPT_DIR.parent.parent
 REPO_ROOT = ONNXRT_DIR.parent
 DEFAULT_BUILD_DIR = REPO_ROOT / "build" / "ort"
 DEIT_EXPORTER = SCRIPT_DIR / "export_deit_ivit_onnx.py"
+FQ_DEIT_EXPORTER = SCRIPT_DIR / "export_fq_deit_onnx.py"
 SWIN_EXPORTER = SCRIPT_DIR / "export_swin_ivit_onnx.py"
 IVIT_PYTORCH_ROOT = REPO_ROOT / "I-ViT"
-SWIN_DEPTHS_FIXED = (2, 2, 6, 2)
+MODEL_SPECS = {
+    "deit_tiny_patch16_224": {"family": "deit", "tag": "deit_tiny"},
+    "deit_small_patch16_224": {"family": "deit", "tag": "deit_small"},
+    "fq_deit_tiny_patch16_224": {"family": "fq_deit", "tag": "fq_deit_tiny"},
+    "swin_tiny_patch4_window7_224": {"family": "swin", "tag": "swin_tiny", "depths": (2, 2, 6, 2)},
+    "swin_small_patch4_window7_224": {"family": "swin", "tag": "swin_small", "depths": (2, 2, 18, 2)},
+}
+SUPPORTED_MODEL_NAMES = tuple(MODEL_SPECS)
 
 
 def _load_ckpt_state_dict(path: Path):
@@ -57,33 +68,69 @@ def _print_onnx_op_counts(model_path: Path, label: str) -> Counter:
     print(f"\n[{label}] {model_path}")
     print(f"  Total nodes: {len(model.graph.node)}")
     for op in (
+        "GemminiMatMulInteger",
         "MatMulInteger",
         "QLinearMatMul",
         "QLinearConv",
+        "QLinearAdd",
         "QLayernorm",
         "Shiftmax",
         "ShiftGELU",
         "MatMul",
         "Conv",
     ):
-        print(f"  {op:14s}: {counts.get(op, 0)}")
+        print(f"  {op:20s}: {counts.get(op, 0)}")
     return counts
 
 
-def export_deit(checkpoint: Path | None, output: Path) -> None:
+def export_deit(
+    model_name: str,
+    checkpoint: Path | None,
+    output: Path,
+    allow_random_init: bool,
+) -> None:
     if not DEIT_EXPORTER.is_file():
         raise FileNotFoundError(f"DeiT exporter not found: {DEIT_EXPORTER}")
 
-    cmd = [sys.executable, str(DEIT_EXPORTER), "--output", str(output)]
+    cmd = [
+        sys.executable,
+        str(DEIT_EXPORTER),
+        "--model-name",
+        model_name,
+        "--output",
+        str(output),
+    ]
     if checkpoint is not None:
         cmd.extend(["--checkpoint", str(checkpoint)])
+    if allow_random_init:
+        cmd.append("--allow-random-init")
     print("Running DeiT I-ViT exporter:")
     print("  " + " ".join(cmd))
     subprocess.run(cmd, check=True)
     _print_onnx_op_counts(output, "DeiT INT8")
 
 
+def export_fq_deit(
+    checkpoint: Path | None,
+    output: Path,
+    allow_random_init: bool,
+) -> None:
+    if not FQ_DEIT_EXPORTER.is_file():
+        raise FileNotFoundError(f"FQ-DeiT exporter not found: {FQ_DEIT_EXPORTER}")
+
+    cmd = [sys.executable, str(FQ_DEIT_EXPORTER), "--output", str(output)]
+    if checkpoint is not None:
+        cmd.extend(["--checkpoint", str(checkpoint)])
+    if allow_random_init:
+        cmd.append("--allow-random-init")
+    print("Running FQ-DeiT exporter:")
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    _print_onnx_op_counts(output, "FQ-DeiT INT8")
+
+
 def export_swin_custom(
+    model_name: str,
     checkpoint: Path | None,
     output: Path,
     allow_random_init: bool,
@@ -94,6 +141,8 @@ def export_swin_custom(
     cmd = [
         sys.executable,
         str(SWIN_EXPORTER),
+        "--model-name",
+        model_name,
         "--output",
         str(output),
     ]
@@ -105,7 +154,7 @@ def export_swin_custom(
     print("Running Swin I-ViT custom-op exporter:")
     print("  " + " ".join(cmd))
     subprocess.run(cmd, check=True)
-    _print_onnx_op_counts(output, "Swin-T INT8 (custom-op)")
+    _print_onnx_op_counts(output, f"{model_name} INT8 (custom-op)")
 
 
 def _lift_swin_matmul_rhs_to_initializers(
@@ -424,7 +473,7 @@ def main() -> int:
     parser.add_argument(
         "--model-name",
         default="deit_tiny_patch16_224",
-        choices=["deit_tiny_patch16_224", "swin_tiny_patch4_window7_224"],
+        choices=SUPPORTED_MODEL_NAMES,
         help="Model to export",
     )
     parser.add_argument(
@@ -459,7 +508,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-random-init",
         action="store_true",
-        help="(Swin only) allow export without checkpoint",
+        help="Allow export without checkpoint using random weights",
     )
     parser.add_argument(
         "--swin-calib-samples",
@@ -488,14 +537,19 @@ def main() -> int:
     build_dir = args.output_dir or DEFAULT_BUILD_DIR
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.model_name == "deit_tiny_patch16_224":
-        output = args.output or (build_dir / "ivit_tiny_int8.onnx")
-        export_deit(args.checkpoint, output)
+    spec = MODEL_SPECS[args.model_name]
+
+    if spec["family"] == "deit":
+        output = args.output or (build_dir / f"ivit_{spec['tag']}_int8.onnx")
+        export_deit(
+            model_name=args.model_name,
+            checkpoint=args.checkpoint,
+            output=output,
+            allow_random_init=args.allow_random_init,
+        )
         print("\nDeiT export done.")
         return 0
 
-    depths = SWIN_DEPTHS_FIXED
-    print(f"Swin depths (fixed): {depths}")
 
     if args.swin_export_style == "custom":
         if args.skip_quantize:
@@ -507,17 +561,18 @@ def main() -> int:
         if args.swin_calib_samples != 4:
             raise ValueError("--swin-calib-samples is only valid for --swin-export-style legacy-qop")
 
-        output = args.output or (build_dir / "swin_tiny_int8.onnx")
+        output = args.output or (build_dir / f"{spec['tag']}_int8.onnx")
         export_swin_custom(
+            model_name=args.model_name,
             checkpoint=args.checkpoint,
             output=output,
             allow_random_init=args.allow_random_init,
         )
-        print("\nSwin-T custom-op export done.")
+        print("\nSwin custom-op export done.")
         return 0
 
-    fp32_output = args.fp32_output or (build_dir / "swin_tiny_fp32.onnx")
-    int8_output = None if args.skip_quantize else (args.output or (build_dir / "swin_tiny_int8.onnx"))
+    fp32_output = args.fp32_output or (build_dir / f"{spec['tag']}_fp32.onnx")
+    int8_output = None if args.skip_quantize else (args.output or (build_dir / f"{spec['tag']}_int8.onnx"))
     export_swin_legacy_qop(
         checkpoint=args.checkpoint,
         fp32_output=fp32_output,
@@ -528,7 +583,7 @@ def main() -> int:
         force_zero_points=not args.no_force_zp0,
         calibration_samples=args.swin_calib_samples,
     )
-    print("\nSwin-T legacy-qop export done.")
+    print("\nSwin legacy-qop export done.")
     return 0
 
 

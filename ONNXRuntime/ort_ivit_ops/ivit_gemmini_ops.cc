@@ -361,6 +361,7 @@ struct GemminiMatMulIntegerKernel {
     const OrtApi* ort;
     int64_t profile_node_index;
     std::string profile_label;
+    bool force_cpu;
 };
 
 void* ORT_API_CALL GemminiMatMulInteger_CreateKernel(
@@ -370,6 +371,7 @@ void* ORT_API_CALL GemminiMatMulInteger_CreateKernel(
     kernel->ort = api;
     kernel->profile_node_index = get_optional_int64_attribute(api, info, "profile_node_index", -1);
     kernel->profile_label = get_optional_string_attribute(api, info, "profile_label");
+    kernel->force_cpu = get_optional_int64_attribute(api, info, "force_cpu", 0) != 0;
     return kernel;
 }
 
@@ -430,7 +432,7 @@ void ORT_API_CALL GemminiMatMulInteger_Compute(void* op_kernel, OrtKernelContext
         const int8_t* a_ptr = a + batch_idx * a_stride;
         const int8_t* b_ptr = (b_dims.size() == 2) ? b : (b + batch_idx * b_stride);
         int32_t* out_ptr = out + batch_idx * out_stride;
-        if (mode == 0) {
+        if (mode == 0 || kernel->force_cpu) {
             cpu_matmul_int32(a_ptr, b_ptr, out_ptr, rows, cols, depth);
         } else {
             gemmini_matmul_int32(a_ptr, b_ptr, out_ptr, rows, cols, depth, mode);
@@ -510,6 +512,339 @@ OrtCustomOp make_gemmini_matmul_integer_op() {
     op.KernelDestroy = GemminiMatMulInteger_Destroy;
     op.GetInputCharacteristic = GemminiMatMulInteger_GetInputCharacteristic;
     op.GetOutputCharacteristic = GemminiMatMulInteger_GetOutputCharacteristic;
+    return op;
+}
+
+void run_int8_matmul(const int8_t* a, const int8_t* b, int32_t* y,
+        int64_t m, int64_t n, int64_t k, int mode) {
+#ifdef IVIT_USE_GEMMINI
+    if (mode != 0) {
+        gemmini_matmul_int32(a, b, y, m, n, k, mode);
+        return;
+    }
+#endif
+    (void)mode;
+    cpu_matmul_int32(a, b, y, m, n, k);
+}
+
+inline int8_t twin_clamp_i8(float v, float lo, float hi) {
+    v = std::min(std::max(v, lo), hi);
+    const float r = std::nearbyintf(v);
+    return static_cast<int8_t>(std::min(std::max(r, lo), hi));
+}
+
+/* ── ivit.TwinSoftmaxMatMul (Gemmini int MM for hi/lo twins) ─────────────── */
+struct TwinSoftmaxMatMulKernel {
+    const OrtApi* ort;
+};
+
+void* ORT_API_CALL TwinSoftmaxMatMul_CreateKernel(
+        const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
+    (void)op;
+    (void)info;
+    auto* kernel = new TwinSoftmaxMatMulKernel();
+    kernel->ort = api;
+    return kernel;
+}
+
+void ORT_API_CALL TwinSoftmaxMatMul_Destroy(void* op_kernel) {
+    delete static_cast<TwinSoftmaxMatMulKernel*>(op_kernel);
+}
+
+void ORT_API_CALL TwinSoftmaxMatMul_Compute(void* op_kernel, OrtKernelContext* ctx) {
+    auto* kernel = static_cast<TwinSoftmaxMatMulKernel*>(op_kernel);
+    const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+
+    const OrtValue* attn_v = nullptr;
+    const OrtValue* v_v = nullptr;
+    const OrtValue* split_v = nullptr;
+    const OrtValue* ai_v = nullptr;
+    const OrtValue* bi_v = nullptr;
+    ort->KernelContext_GetInput(ctx, 0, &attn_v);
+    ort->KernelContext_GetInput(ctx, 1, &v_v);
+    ort->KernelContext_GetInput(ctx, 2, &split_v);
+    ort->KernelContext_GetInput(ctx, 3, &ai_v);
+    ort->KernelContext_GetInput(ctx, 4, &bi_v);
+
+    const auto a_dims = get_dims(ort, attn_v);
+    const auto v_dims = get_dims(ort, v_v);
+    if (a_dims.size() != 4 || v_dims.size() != 4) {
+        throw std::runtime_error("TwinSoftmaxMatMul expects rank-4 attn and V");
+    }
+    const int64_t B = a_dims[0];
+    const int64_t H = a_dims[1];
+    const int64_t N = a_dims[2];
+    const int64_t D = v_dims[3];
+    if (a_dims[3] != N || v_dims[0] != B || v_dims[1] != H || v_dims[2] != N) {
+        throw std::runtime_error("TwinSoftmaxMatMul shape mismatch");
+    }
+
+    const float* attn = get_tensor_data<float>(ort, attn_v);
+    const int8_t* V = get_tensor_data<int8_t>(ort, v_v);
+    const float split = require_scalar_tensor_value<float>(ort, split_v, "split");
+    const float a_interval = require_scalar_tensor_value<float>(ort, ai_v, "a_interval");
+    const float* bi = get_tensor_data<float>(ort, bi_v);
+
+    const std::vector<int64_t> out_dims = {B, H, N, D};
+    OrtValue* out_value = nullptr;
+    ort->KernelContext_GetOutput(ctx, 0, out_dims.data(), out_dims.size(), &out_value);
+    float* out = get_mutable_tensor_data<float>(ort, out_value);
+
+    std::vector<int8_t> q_hi(static_cast<size_t>(N * N));
+    std::vector<int8_t> q_lo(static_cast<size_t>(N * N));
+    std::vector<int32_t> acc_hi(static_cast<size_t>(N * D));
+    std::vector<int32_t> acc_lo(static_cast<size_t>(N * D));
+    const int mode = clamp_mode(g_ivit_execution_mode);
+
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h = 0; h < H; ++h) {
+            const float* A = attn + ((b * H + h) * N) * N;
+            const int8_t* VV = V + ((b * H + h) * N) * D;
+            float* O = out + ((b * H + h) * N) * D;
+            const float bscale = bi[h];
+
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t j = 0; j < N; ++j) {
+                    const float a = A[i * N + j];
+                    float hi_src = a < split ? split : a;
+                    if (hi_src > 1.0f) {
+                        hi_src = 1.0f;
+                    }
+                    float lo_src = a < 0.0f ? 0.0f : a;
+                    if (lo_src > split) {
+                        lo_src = split;
+                    }
+                    q_hi[static_cast<size_t>(i * N + j)] = twin_clamp_i8(hi_src * 127.0f, 0.0f, 127.0f);
+                    q_lo[static_cast<size_t>(i * N + j)] =
+                            twin_clamp_i8(lo_src / a_interval, 0.0f, 127.0f);
+                }
+            }
+
+            run_int8_matmul(q_hi.data(), VV, acc_hi.data(), N, D, N, mode);
+            run_int8_matmul(q_lo.data(), VV, acc_lo.data(), N, D, N, mode);
+
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t d = 0; d < D; ++d) {
+                    const int64_t idx = i * D + d;
+                    O[idx] = (static_cast<float>(acc_hi[static_cast<size_t>(idx)]) / 127.0f
+                                    + static_cast<float>(acc_lo[static_cast<size_t>(idx)]) * a_interval)
+                            * bscale;
+                }
+            }
+        }
+    }
+
+    ort_log_node_cycles(-1, "", "TwinSoftmaxMatMul", ort_profile_read_cycles() - profile_start);
+}
+
+const char* ORT_API_CALL TwinSoftmaxMatMul_GetName(const OrtCustomOp* op) {
+    (void)op;
+    return "TwinSoftmaxMatMul";
+}
+const char* ORT_API_CALL TwinSoftmaxMatMul_GetExecutionProviderType(const OrtCustomOp* op) {
+    (void)op;
+    return "CPUExecutionProvider";
+}
+ONNXTensorElementDataType ORT_API_CALL TwinSoftmaxMatMul_GetInputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    return idx == 1 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL TwinSoftmaxMatMul_GetInputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 5;
+}
+ONNXTensorElementDataType ORT_API_CALL TwinSoftmaxMatMul_GetOutputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL TwinSoftmaxMatMul_GetOutputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 1;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL TwinSoftmaxMatMul_GetInputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL TwinSoftmaxMatMul_GetOutputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+
+OrtCustomOp make_twin_softmax_matmul_op() {
+    OrtCustomOp op{};
+    op.version = ORT_API_VERSION;
+    op.CreateKernel = TwinSoftmaxMatMul_CreateKernel;
+    op.GetName = TwinSoftmaxMatMul_GetName;
+    op.GetExecutionProviderType = TwinSoftmaxMatMul_GetExecutionProviderType;
+    op.GetInputType = TwinSoftmaxMatMul_GetInputType;
+    op.GetInputTypeCount = TwinSoftmaxMatMul_GetInputTypeCount;
+    op.GetOutputType = TwinSoftmaxMatMul_GetOutputType;
+    op.GetOutputTypeCount = TwinSoftmaxMatMul_GetOutputTypeCount;
+    op.KernelCompute = TwinSoftmaxMatMul_Compute;
+    op.KernelDestroy = TwinSoftmaxMatMul_Destroy;
+    op.GetInputCharacteristic = TwinSoftmaxMatMul_GetInputCharacteristic;
+    op.GetOutputCharacteristic = TwinSoftmaxMatMul_GetOutputCharacteristic;
+    return op;
+}
+
+/* ── ivit.TwinGeluLinear (Gemmini int MM for pos/neg twins) ──────────────── */
+struct TwinGeluLinearKernel {
+    const OrtApi* ort;
+};
+
+void* ORT_API_CALL TwinGeluLinear_CreateKernel(
+        const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
+    (void)op;
+    (void)info;
+    auto* kernel = new TwinGeluLinearKernel();
+    kernel->ort = api;
+    return kernel;
+}
+
+void ORT_API_CALL TwinGeluLinear_Destroy(void* op_kernel) {
+    delete static_cast<TwinGeluLinearKernel*>(op_kernel);
+}
+
+void ORT_API_CALL TwinGeluLinear_Compute(void* op_kernel, OrtKernelContext* ctx) {
+    auto* kernel = static_cast<TwinGeluLinearKernel*>(op_kernel);
+    const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+
+    const OrtValue* x_val = nullptr;
+    const OrtValue* w_val = nullptr;
+    const OrtValue* ai_val = nullptr;
+    const OrtValue* an_val = nullptr;
+    const OrtValue* ws_val = nullptr;
+    const OrtValue* b_val = nullptr;
+    ort->KernelContext_GetInput(ctx, 0, &x_val);
+    ort->KernelContext_GetInput(ctx, 1, &w_val);
+    ort->KernelContext_GetInput(ctx, 2, &ai_val);
+    ort->KernelContext_GetInput(ctx, 3, &an_val);
+    ort->KernelContext_GetInput(ctx, 4, &ws_val);
+    ort->KernelContext_GetInput(ctx, 5, &b_val);
+
+    const auto x_dims = get_dims(ort, x_val);
+    const auto w_dims = get_dims(ort, w_val);
+    if (x_dims.size() < 2 || w_dims.size() != 2) {
+        throw std::runtime_error("TwinGeluLinear expects x rank>=2 and weight [K,N]");
+    }
+    const int64_t K = x_dims.back();
+    const int64_t N = w_dims[1];
+    if (w_dims[0] != K) {
+        throw std::runtime_error("TwinGeluLinear weight in_features mismatch");
+    }
+    int64_t rows = 1;
+    for (size_t i = 0; i + 1 < x_dims.size(); ++i) {
+        rows *= x_dims[i];
+    }
+
+    const float* x = get_tensor_data<float>(ort, x_val);
+    const int8_t* w = get_tensor_data<int8_t>(ort, w_val);
+    const float a_interval = require_scalar_tensor_value<float>(ort, ai_val, "a_interval");
+    const float a_neg = require_scalar_tensor_value<float>(ort, an_val, "a_neg_interval");
+    const float* ws = get_tensor_data<float>(ort, ws_val);
+    const float* bias = get_tensor_data<float>(ort, b_val);
+
+    auto out_dims = x_dims;
+    out_dims.back() = N;
+    OrtValue* out_value = nullptr;
+    ort->KernelContext_GetOutput(ctx, 0, out_dims.data(), out_dims.size(), &out_value);
+    float* out = get_mutable_tensor_data<float>(ort, out_value);
+
+    std::vector<int8_t> q_pos(static_cast<size_t>(rows * K));
+    std::vector<int8_t> q_neg(static_cast<size_t>(rows * K));
+    std::vector<int32_t> acc_pos(static_cast<size_t>(rows * N));
+    std::vector<int32_t> acc_neg(static_cast<size_t>(rows * N));
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const float* xr = x + r * K;
+        for (int64_t k = 0; k < K; ++k) {
+            const float xv = xr[k];
+            q_pos[static_cast<size_t>(r * K + k)] =
+                    twin_clamp_i8((xv > 0.0f ? xv : 0.0f) / a_interval, 0.0f, 127.0f);
+            q_neg[static_cast<size_t>(r * K + k)] =
+                    twin_clamp_i8((xv < 0.0f ? xv : 0.0f) / a_neg, -127.0f, 0.0f);
+        }
+    }
+
+    const int mode = clamp_mode(g_ivit_execution_mode);
+    run_int8_matmul(q_pos.data(), w, acc_pos.data(), rows, N, K, mode);
+    run_int8_matmul(q_neg.data(), w, acc_neg.data(), rows, N, K, mode);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t n = 0; n < N; ++n) {
+            const int64_t idx = r * N + n;
+            out[idx] = static_cast<float>(acc_pos[static_cast<size_t>(idx)]) * (a_interval * ws[n])
+                    + static_cast<float>(acc_neg[static_cast<size_t>(idx)]) * (a_neg * ws[n])
+                    + bias[n];
+        }
+    }
+
+    ort_log_node_cycles(-1, "", "TwinGeluLinear", ort_profile_read_cycles() - profile_start);
+}
+
+const char* ORT_API_CALL TwinGeluLinear_GetName(const OrtCustomOp* op) {
+    (void)op;
+    return "TwinGeluLinear";
+}
+const char* ORT_API_CALL TwinGeluLinear_GetExecutionProviderType(const OrtCustomOp* op) {
+    (void)op;
+    return "CPUExecutionProvider";
+}
+ONNXTensorElementDataType ORT_API_CALL TwinGeluLinear_GetInputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    return idx == 1 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL TwinGeluLinear_GetInputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 6;
+}
+ONNXTensorElementDataType ORT_API_CALL TwinGeluLinear_GetOutputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL TwinGeluLinear_GetOutputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 1;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL TwinGeluLinear_GetInputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL TwinGeluLinear_GetOutputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+
+OrtCustomOp make_twin_gelu_linear_op() {
+    OrtCustomOp op{};
+    op.version = ORT_API_VERSION;
+    op.CreateKernel = TwinGeluLinear_CreateKernel;
+    op.GetName = TwinGeluLinear_GetName;
+    op.GetExecutionProviderType = TwinGeluLinear_GetExecutionProviderType;
+    op.GetInputType = TwinGeluLinear_GetInputType;
+    op.GetInputTypeCount = TwinGeluLinear_GetInputTypeCount;
+    op.GetOutputType = TwinGeluLinear_GetOutputType;
+    op.GetOutputTypeCount = TwinGeluLinear_GetOutputTypeCount;
+    op.KernelCompute = TwinGeluLinear_Compute;
+    op.KernelDestroy = TwinGeluLinear_Destroy;
+    op.GetInputCharacteristic = TwinGeluLinear_GetInputCharacteristic;
+    op.GetOutputCharacteristic = TwinGeluLinear_GetOutputCharacteristic;
     return op;
 }
 
@@ -2134,6 +2469,8 @@ OrtCustomOp make_repq_uniform_matmul_op() {
 }
 
 OrtCustomOp g_gemmini_matmul_integer_op{};
+OrtCustomOp g_twin_softmax_matmul_op{};
+OrtCustomOp g_twin_gelu_linear_op{};
 OrtCustomOp g_requantize_int32_op{};
 OrtCustomOp g_requantize_int32_to_int16_op{};
 OrtCustomOp g_requantize_int8_to_int16_op{};
@@ -2152,6 +2489,8 @@ void ensure_custom_ops_initialized() {
         return;
     }
     g_gemmini_matmul_integer_op = make_gemmini_matmul_integer_op();
+    g_twin_softmax_matmul_op = make_twin_softmax_matmul_op();
+    g_twin_gelu_linear_op = make_twin_gelu_linear_op();
     g_requantize_int32_op = make_requantize_int32_op();
     g_requantize_int32_to_int16_op = make_requantize_int32_to_int16_op();
     g_requantize_int8_to_int16_op = make_requantize_int8_to_int16_op();
@@ -2176,6 +2515,14 @@ extern "C" OrtStatus* ORT_API_CALL AddIvitGemminiOps(
         OrtCustomOpDomain* domain, const OrtApi* ort) {
     ensure_custom_ops_initialized();
     OrtStatus* status = ort->CustomOpDomain_Add(domain, &g_gemmini_matmul_integer_op);
+    if (status != nullptr) {
+        return status;
+    }
+    status = ort->CustomOpDomain_Add(domain, &g_twin_softmax_matmul_op);
+    if (status != nullptr) {
+        return status;
+    }
+    status = ort->CustomOpDomain_Add(domain, &g_twin_gelu_linear_op);
     if (status != nullptr) {
         return status;
     }

@@ -215,11 +215,15 @@ def parse_cycles(stdout: str) -> int | None:
     return None
 
 
+TVM_MAIN_TOTAL_CYCLES_PREFIX = "[TVM_MAIN_TOTAL_CYCLES],"
+TVM_MAIN_INNER_CYCLES_PREFIX = "[TVM_MAIN_INNER_CYCLES],"
+
+
 def instrument_tvm_main_total_cycles(output_dir: Path) -> None:
     tvm_main_path = _find_tvm_main_source(output_dir)
     content = tvm_main_path.read_text()
 
-    if "[TVM_MAIN_TOTAL_CYCLES]," in content:
+    if TVM_MAIN_INNER_CYCLES_PREFIX in content:
         return
 
     support_code = """
@@ -269,7 +273,7 @@ static inline uint64_t tvm_profile_read_cycles(void) {
 static uint64_t tvm_profile_main_cycles = 0;
 
 static void tvm_profile_dump_main_cycles(void) {
-  tvm_profile_print_str("[TVM_MAIN_TOTAL_CYCLES],");
+  tvm_profile_print_str("[TVM_MAIN_INNER_CYCLES],");
   tvm_profile_print_dec(tvm_profile_main_cycles);
   tvm_profile_print_str("\\n");
 }

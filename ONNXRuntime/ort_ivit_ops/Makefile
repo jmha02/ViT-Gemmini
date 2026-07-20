@@ -87,7 +87,7 @@ $(LIB): $(RISCV_OBJS)
 
 $(HOST_LIB): $(HOST_OBJS)
 	mkdir -p $(dir $@)
-	$(HOST_CXX) -shared -o $@ $^
+	$(HOST_CXX) -shared -o $@ $^ -lm
 
 clean:
 	rm -f $(RISCV_OBJS) $(HOST_OBJS) $(LIB) $(HOST_LIB)

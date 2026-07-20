@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Swin-Tiny (I-ViT quantized) -> ONNX INT8 graph builder (DeiT-style custom-op flow).
+Swin I-ViT quantized -> ONNX INT8 graph builder (DeiT-style custom-op flow).
 
 This exporter builds a graph that uses:
 - Gemmini-friendly INT8 ops: QLinearConv, ivit.GemminiMatMulInteger
@@ -8,7 +8,7 @@ This exporter builds a graph that uses:
 - I-ViT custom ops (domain=ivit): QLayernorm, Shiftmax, ShiftGELU
 
 The intent is to keep Swin on the same export style as DeiT I-ViT.
-Model depth is fixed to Swin-Tiny baseline: (2, 2, 6, 2).
+Model depth is selected from the requested Swin variant.
 """
 
 from __future__ import annotations
@@ -54,7 +54,19 @@ EMBED_DIM = 96
 NUM_CLASSES = 1000
 BATCH = 1
 STAGE_HEADS = (3, 6, 12, 24)
-SWIN_DEPTHS = (2, 2, 6, 2)
+MODEL_SPECS = {
+    "swin_tiny_patch4_window7_224": {
+        "depths": (2, 2, 6, 2),
+        "output": REPO_ROOT / "build" / "ort" / "swin_tiny_int8.onnx",
+        "graph": "ivit_swin_tiny",
+    },
+    "swin_small_patch4_window7_224": {
+        "depths": (2, 2, 18, 2),
+        "output": REPO_ROOT / "build" / "ort" / "swin_small_int8.onnx",
+        "graph": "ivit_swin_small",
+    },
+}
+SUPPORTED_MODEL_NAMES = tuple(MODEL_SPECS)
 DEAD_CHANNEL_THRESHOLD = 0.01
 
 
@@ -665,7 +677,12 @@ def _build_swin_ivit_graph(
     head_b = to_int32(get_weight(sd, "head.bias_integer")).reshape(-1)
     head_ws = get_scale(sd, "head.fc_scaling_factor")
 
-    head_int32 = g.gemmini_matmul_integer(flat, head_w, "head_mm")
+    head_int32 = g.gemmini_matmul_integer(
+        flat,
+        head_w,
+        "head_mm",
+        force_cpu=True,
+    )
     head_b_name = g.init_tensor("head_bias", head_b)
     g.add("Add", [head_int32, head_b_name], ["head_biased"])
     g.add("Cast", ["head_biased"], ["head_cast_f32"], to=TensorProto.FLOAT)
@@ -680,7 +697,12 @@ def _build_swin_ivit_graph(
 
     input_vi = helper.make_tensor_value_info("image", TensorProto.FLOAT, [BATCH, IN_CHANNELS, IMG_SIZE, IMG_SIZE])
     output_vi = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [BATCH, NUM_CLASSES])
-    graph = helper.make_graph(g.nodes, "ivit_swin_tiny", [input_vi], [output_vi], initializer=g.initializers)
+    graph_name = "ivit_swin"
+    for spec in MODEL_SPECS.values():
+        if depths == spec["depths"]:
+            graph_name = spec["graph"]
+            break
+    graph = helper.make_graph(g.nodes, graph_name, [input_vi], [output_vi], initializer=g.initializers)
     model = helper.make_model(
         graph,
         opset_imports=[
@@ -695,8 +717,14 @@ def _build_swin_ivit_graph(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build Swin-Tiny I-ViT-style INT8 ONNX graph with custom ops",
+        description="Build Swin I-ViT-style INT8 ONNX graph with custom ops",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model-name",
+        default="swin_tiny_patch4_window7_224",
+        choices=SUPPORTED_MODEL_NAMES,
+        help="I-ViT Swin model variant",
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Swin I-ViT QAT checkpoint path")
     parser.add_argument("--allow-random-init", action="store_true", help="Allow export with random weights")
@@ -706,19 +734,22 @@ def main() -> int:
         default="matmul",
         help="Patch embedding lowering to use for the initial projection",
     )
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Output ONNX path")
+    parser.add_argument("--output", type=Path, default=None, help="Output ONNX path")
     args = parser.parse_args()
 
-    depths = SWIN_DEPTHS
-    print(f"Swin depths (fixed): {depths}")
+    spec = MODEL_SPECS[args.model_name]
+    depths = spec["depths"]
+    output = args.output or spec["output"]
+    print(f"Swin model: {args.model_name}")
+    print(f"Swin depths: {depths}")
     print(f"Patch embed op: {args.patch_embed_op}")
     sd = _prepare_swin_state_dict(args.checkpoint, args.allow_random_init, depths)
     model = _build_swin_ivit_graph(sd, depths, args.patch_embed_op)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    onnx.save(model, str(args.output))
-    size_mb = args.output.stat().st_size / 1024.0 / 1024.0
-    print(f"Saved: {args.output} ({size_mb:.1f} MB)")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(model, str(output))
+    size_mb = output.stat().st_size / 1024.0 / 1024.0
+    print(f"Saved: {output} ({size_mb:.1f} MB)")
 
     try:
         onnx.checker.check_model(model)

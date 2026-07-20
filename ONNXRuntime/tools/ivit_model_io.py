@@ -43,12 +43,14 @@ def load_checkpoint_state_dict(path: str | Path) -> dict:
 
 def create_model(model_name: str):
     """Instantiate a supported I-ViT model without loading weights."""
-    from models.swin_quant import swin_tiny_patch4_window7_224
-    from models.vit_quant import deit_tiny_patch16_224
+    from models.swin_quant import swin_small_patch4_window7_224, swin_tiny_patch4_window7_224
+    from models.vit_quant import deit_small_patch16_224, deit_tiny_patch16_224
 
     builders = {
         "deit_tiny_patch16_224": deit_tiny_patch16_224,
+        "deit_small_patch16_224": deit_small_patch16_224,
         "swin_tiny_patch4_window7_224": swin_tiny_patch4_window7_224,
+        "swin_small_patch4_window7_224": swin_small_patch4_window7_224,
     }
     try:
         return builders[model_name](pretrained=False)

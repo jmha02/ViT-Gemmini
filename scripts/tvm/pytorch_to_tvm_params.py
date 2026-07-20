@@ -9,7 +9,14 @@ from models.ivit.layers import QConfig, QuantizeContext
 
 DEIT_DEPTH_DEFAULT = 12
 SWIN_TINY_DEPTHS = (2, 2, 6, 2)
-SWIN_TINY_NUM_STAGES = len(SWIN_TINY_DEPTHS)
+SWIN_SMALL_DEPTHS = (2, 2, 18, 2)
+SWIN_DEPTHS_BY_MODEL = {
+    "swin_tiny_patch4_window7_224": SWIN_TINY_DEPTHS,
+    "swin_small_patch4_window7_224": SWIN_SMALL_DEPTHS,
+}
+FQ_MODELS = {
+    "fq_deit_tiny_patch16_224",
+}
 
 
 def clip_to_int32(arr):
@@ -33,6 +40,8 @@ def _as_state_dict(model):
 
 def _detect_model_name(model):
     keys = model.keys()
+    if any("weight_q_t" in key for key in keys):
+        return "fq_deit_tiny_patch16_224"
     if any(k.startswith("layers.0.blocks.0") for k in keys):
         return "swin_tiny_patch4_window7_224"
     if any(k.startswith("blocks.0") for k in keys):
@@ -175,7 +184,7 @@ def _build_deit_param_dict(model, depth):
     return renamed_params
 
 
-def _build_swin_tiny_param_dict(model):
+def _build_swin_param_dict(model, depths):
     params = _collect_quantized_params(model)
     renamed_params = {}
 
@@ -195,8 +204,7 @@ def _build_swin_tiny_param_dict(model):
     )
     renamed_params["patch_embed_norm_bias"] = patch_norm_bias
 
-    for stage in range(SWIN_TINY_NUM_STAGES):
-        depth = SWIN_TINY_DEPTHS[stage]
+    for stage, depth in enumerate(depths):
         for block in range(depth):
             ckpt_prefix = f"layers.{stage}.blocks.{block}"
             relay_prefix = f"stage{stage}_block{block}"
@@ -248,7 +256,7 @@ def _build_swin_tiny_param_dict(model):
                 f"{ckpt_prefix}.attn.relative_position_bias_table"
             ].cpu().numpy().astype("float32")
 
-        if stage < SWIN_TINY_NUM_STAGES - 1:
+        if stage < len(depths) - 1:
             ckpt_prefix = f"layers.{stage}.downsample"
             relay_prefix = f"stage{stage}_downsample"
 
@@ -278,14 +286,19 @@ def _build_swin_tiny_param_dict(model):
     return renamed_params
 
 
+from models.ivit.fq_checkpoint import build_fq_param_dict
+
+
 def build_param_dict(model, depth=DEIT_DEPTH_DEFAULT, model_name=None):
     model = _as_state_dict(model)
     resolved_model = _resolve_model_name(model, model_name=model_name)
 
+    if resolved_model in FQ_MODELS:
+        return build_fq_param_dict(model)
     if resolved_model.startswith("deit_"):
         return _build_deit_param_dict(model, depth=depth)
-    if resolved_model == "swin_tiny_patch4_window7_224":
-        return _build_swin_tiny_param_dict(model)
+    if resolved_model in SWIN_DEPTHS_BY_MODEL:
+        return _build_swin_param_dict(model, SWIN_DEPTHS_BY_MODEL[resolved_model])
 
     raise RuntimeError(f"Unsupported model_name: {resolved_model}")
 
@@ -422,7 +435,7 @@ def _load_qconfig_deit(model, depth):
     )
 
 
-def _load_qconfig_swin_tiny(model):
+def _load_qconfig_swin(model, depths):
     params = _collect_scaling_factors(model)
 
     conv_input_scale = params["qact_input.act_scaling_factor"]
@@ -458,8 +471,7 @@ def _load_qconfig_swin_tiny(model):
 
     current_scale = params["qact1.act_scaling_factor"]
 
-    for stage in range(SWIN_TINY_NUM_STAGES):
-        depth = SWIN_TINY_DEPTHS[stage]
+    for stage, depth in enumerate(depths):
 
         for block in range(depth):
             ckpt_prefix = f"layers.{stage}.blocks.{block}"
@@ -578,7 +590,7 @@ def _load_qconfig_swin_tiny(model):
 
             current_scale = output_scale
 
-        if stage < SWIN_TINY_NUM_STAGES - 1:
+        if stage < len(depths) - 1:
             ckpt_prefix = f"layers.{stage}.downsample"
             relay_prefix = f"stage{stage}_downsample"
 
@@ -650,12 +662,14 @@ def load_qconfig(model, depth=DEIT_DEPTH_DEFAULT, model_name=None):
     QuantizeContext.qconfig_dict = {}
     QuantizeContext.qconfig_print = {}
 
+    if resolved_model in FQ_MODELS:
+        return
     if resolved_model.startswith("deit_"):
         _load_qconfig_deit(model, depth=depth)
         return
-    if resolved_model == "swin_tiny_patch4_window7_224":
+    if resolved_model in SWIN_DEPTHS_BY_MODEL:
         try:
-            _load_qconfig_swin_tiny(model)
+            _load_qconfig_swin(model, SWIN_DEPTHS_BY_MODEL[resolved_model])
         except KeyError as exc:
             sample_keys = list(model.keys())[:12]
             raise RuntimeError(
@@ -685,7 +699,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-name",
         default=None,
-        choices=["deit_tiny_patch16_224", "swin_tiny_patch4_window7_224"],
+        choices=[
+            "deit_tiny_patch16_224",
+            "deit_small_patch16_224",
+            "fq_deit_tiny_patch16_224",
+            "swin_tiny_patch4_window7_224",
+            "swin_small_patch4_window7_224",
+        ],
         help="Model name (omit to auto-detect from checkpoint keys)",
     )
 

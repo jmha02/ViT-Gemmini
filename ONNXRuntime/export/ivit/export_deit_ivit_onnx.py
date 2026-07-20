@@ -1,5 +1,5 @@
 """
-I-ViT DeiT-Tiny → ONNX QOperator graph builder.
+I-ViT DeiT → ONNX QOperator graph builder.
 
 Constructs a fully-INT8 ONNX graph directly from the I-ViT QAT checkpoint,
 using the same weights (weight_integer) and scales (scaling_factor) as the
@@ -46,7 +46,7 @@ TOOLS_DIR = ONNXRT_DIR / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from ivit_model_io import load_checkpoint_state_dict
+from ivit_model_io import create_model, load_checkpoint_state_dict
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = REPO_ROOT / "build" / "ort"
@@ -55,10 +55,17 @@ DEFAULT_CKPT    = "/root/checkpoint_last.pth.tar"
 DEFAULT_IMAGE = REPO_ROOT / "scripts" / "gemmini" / "test_cat.jpg"
 DEFAULT_HOST_CUSTOM_OP_LIB = REPO_ROOT / "build" / "ort" / "ort_ivit_ops" / "libivit_ops_host.so"
 
-# DeiT-Tiny constants
-EMBED_DIM   = 192
-DEPTH       = 12
-NUM_HEADS   = 3
+MODEL_SPECS = {
+    "deit_tiny_patch16_224": {"embed_dim": 192, "depth": 12, "num_heads": 3, "tag": "tiny"},
+    "deit_small_patch16_224": {"embed_dim": 384, "depth": 12, "num_heads": 6, "tag": "small"},
+}
+SUPPORTED_MODEL_NAMES = tuple(MODEL_SPECS)
+
+# Defaults are kept as module globals because the graph builder uses these
+# constants throughout the hand-written ONNX topology.
+EMBED_DIM   = MODEL_SPECS["deit_tiny_patch16_224"]["embed_dim"]
+DEPTH       = MODEL_SPECS["deit_tiny_patch16_224"]["depth"]
+NUM_HEADS   = MODEL_SPECS["deit_tiny_patch16_224"]["num_heads"]
 HEAD_DIM    = EMBED_DIM // NUM_HEADS  # 64
 MLP_RATIO   = 4
 HIDDEN_DIM  = EMBED_DIM * MLP_RATIO  # 768
@@ -71,6 +78,22 @@ NUM_CLASSES = 1000
 
 INT8_ZERO  = np.array(0, dtype=np.int8)
 FLOAT_ZERO = np.array(0.0, dtype=np.float32)
+
+
+def configure_model(model_name: str) -> dict:
+    try:
+        spec = MODEL_SPECS[model_name]
+    except KeyError as exc:
+        supported = ", ".join(SUPPORTED_MODEL_NAMES)
+        raise ValueError(f"Unsupported model_name={model_name!r}; supported: {supported}") from exc
+
+    global EMBED_DIM, DEPTH, NUM_HEADS, HEAD_DIM, HIDDEN_DIM
+    EMBED_DIM = spec["embed_dim"]
+    DEPTH = spec["depth"]
+    NUM_HEADS = spec["num_heads"]
+    HEAD_DIM = EMBED_DIM // NUM_HEADS
+    HIDDEN_DIM = EMBED_DIM * MLP_RATIO
+    return spec
 
 # ── Graph builder ─────────────────────────────────────────────────────────────
 
@@ -366,13 +389,34 @@ class OnnxBuilder:
             return self.requantize_int32(biased, natural_scale, y_scale, f"{name_prefix}_req")
         raise ValueError(f"Unsupported patch embedding output dtype: {out_dtype}")
 
-    def gemmini_matmul_integer(self, a, b_data: np.ndarray, name_prefix: str) -> str:
+    def gemmini_matmul_integer(
+        self,
+        a,
+        b_data: np.ndarray,
+        name_prefix: str,
+        *,
+        force_cpu: bool = False,
+    ) -> str:
         """ivit.GemminiMatMulInteger: A(int8) @ B(int8) → int32."""
         a_zp_n = self.scalar_i8(f"{name_prefix}_a_zp", 0)
         b_name = self.init_tensor(f"{name_prefix}_weight", b_data.astype(np.int8))
-        return self.gemmini_matmul_integer_inputs(a, b_name, name_prefix, a_zp_n=a_zp_n)
+        return self.gemmini_matmul_integer_inputs(
+            a,
+            b_name,
+            name_prefix,
+            a_zp_n=a_zp_n,
+            force_cpu=force_cpu,
+        )
 
-    def gemmini_matmul_integer_inputs(self, a, b, name_prefix: str, a_zp_n: str | None = None) -> str:
+    def gemmini_matmul_integer_inputs(
+        self,
+        a,
+        b,
+        name_prefix: str,
+        a_zp_n: str | None = None,
+        *,
+        force_cpu: bool = False,
+    ) -> str:
         """ivit.GemminiMatMulInteger: A(int8) @ B(int8) → int32."""
         if a_zp_n is None:
             a_zp_n = self.scalar_i8(f"{name_prefix}_a_zp", 0)
@@ -383,6 +427,7 @@ class OnnxBuilder:
             "ivit",
             [a, b, a_zp_n, b_zp_n],
             [out],
+            force_cpu=int(force_cpu),
         )
         return out
 
@@ -698,11 +743,12 @@ def fix_final_norm_bias_and_scale(sd):
 
 # ── Graph construction ────────────────────────────────────────────────────────
 
-def build_ivit_graph(sd) -> onnx.ModelProto:
+def build_ivit_graph(sd, model_name="deit_tiny_patch16_224") -> onnx.ModelProto:
     """
-    Build full I-ViT DeiT-Tiny ONNX graph from I-ViT QAT state_dict.
+    Build full I-ViT DeiT ONNX graph from I-ViT QAT state_dict.
     Matches the quantization config extracted by TVM_benchmark/convert_model.py.
     """
+    configure_model(model_name)
     g = OnnxBuilder()
 
     # ── Input ──────────────────────────────────────────────────────────────────
@@ -975,7 +1021,12 @@ def build_ivit_graph(sd) -> onnx.ModelProto:
     head_ws = get_scale(sd, "head.fc_scaling_factor") # scalar or [1000]
 
     # TVM: output_scale = qact2 * head_ws  (convert_model.py L148-150)
-    head_int32 = g.gemmini_matmul_integer(cls_flat, head_w.T.astype(np.int8), "head_mm")
+    head_int32 = g.gemmini_matmul_integer(
+        cls_flat,
+        head_w.T.astype(np.int8),
+        "head_mm",
+        force_cpu=True,
+    )
     head_b_name = g.init_tensor("head_bias", to_int32(head_b))
     g.add("Add", [head_int32, head_b_name], ["head_biased"])
 
@@ -999,7 +1050,7 @@ def build_ivit_graph(sd) -> onnx.ModelProto:
 
     graph = helper.make_graph(
         g.nodes,
-        "ivit_deit_tiny",
+        f"ivit_{model_name.replace('_patch16_224', '')}",
         [input_vi],
         [output_vi],
         initializer=g.initializers,
@@ -1021,6 +1072,20 @@ def build_ivit_graph(sd) -> onnx.ModelProto:
 def load_state_dict(checkpoint_path: str) -> dict:
     """Load I-ViT checkpoint state_dict."""
     return load_checkpoint_state_dict(checkpoint_path)
+
+
+def build_random_state_dict(model_name: str) -> dict:
+    import torch
+
+    sys.path.insert(0, str(REPO_ROOT / "I-ViT"))
+    from models.model_utils import freeze_model
+
+    model = create_model(model_name)
+    model.eval()
+    freeze_model(model)
+    with torch.no_grad():
+        model(torch.randn(1, IN_CHANNELS, IMG_SIZE, IMG_SIZE))
+    return model.state_dict()
 
 
 # ── Host verification ─────────────────────────────────────────────────────────
@@ -1076,29 +1141,45 @@ def verify(model_path, image_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build I-ViT DeiT-Tiny INT8 ONNX graph for onnxruntime-riscv/Gemmini",
+        description="Build I-ViT DeiT INT8 ONNX graph for onnxruntime-riscv/Gemmini",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--checkpoint", default=DEFAULT_CKPT,
+    parser.add_argument(
+        "--model-name",
+        default="deit_tiny_patch16_224",
+        choices=SUPPORTED_MODEL_NAMES,
+        help="I-ViT DeiT model variant",
+    )
+    parser.add_argument("--checkpoint", default=None,
                         help="I-ViT QAT checkpoint (checkpoint_last.pth.tar)")
     parser.add_argument("--output",     default=OUTPUT_ONNX,
                         help="Output ONNX path")
+    parser.add_argument("--allow-random-init", action="store_true",
+                        help="Allow export without checkpoint using random weights")
     parser.add_argument("--verify",     action="store_true",
                         help="Run host onnxruntime sanity check after export")
     parser.add_argument("--image",      default=DEFAULT_IMAGE,
                         help="Test image for --verify")
     args = parser.parse_args()
 
-    if not os.path.exists(args.checkpoint):
+    spec = configure_model(args.model_name)
+    if args.checkpoint is None and not args.allow_random_init:
+        print("ERROR: --checkpoint is required unless --allow-random-init is set")
+        sys.exit(1)
+    if args.checkpoint is not None and not os.path.exists(args.checkpoint) and not args.allow_random_init:
         print(f"ERROR: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    sd = load_state_dict(args.checkpoint)
+    if args.checkpoint is not None and os.path.exists(args.checkpoint):
+        print(f"Loading checkpoint: {args.checkpoint}")
+        sd = load_state_dict(args.checkpoint)
+    else:
+        print(f"[WARN] Exporting {args.model_name} with random-initialized weights.")
+        sd = build_random_state_dict(args.model_name)
     print(f"  Keys loaded: {len(sd)}")
 
-    print(f"\nBuilding I-ViT DeiT-Tiny ONNX graph ...")
-    model = build_ivit_graph(sd)
+    print(f"\nBuilding I-ViT DeiT-{spec['tag'].title()} ONNX graph ...")
+    model = build_ivit_graph(sd, model_name=args.model_name)
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     onnx.save(model, args.output)

@@ -7,7 +7,16 @@ graphs:
 - `ivit.Shiftmax`
 - `ivit.ShiftGELU`
 - `ivit.GemminiMatMulInteger`
+- `ivit.FQPTFLayerNorm` — flexi FQ-DeiT PTF LayerNorm (CPU)
+- `ivit.FQQKMatMul` — flexi FQ-DeiT Q@K^T reference kernel (CPU only; **not used** in `fq_deit_tiny_int8.onnx` — export uses `GemminiMatMulInteger` instead)
+- `ivit.FQLISSoftmax` — flexi FQ-DeiT log-domain softmax (CPU)
+- `ivit.FQAttnVMatMul` — flexi FQ-DeiT Attn@V shift reduction (CPU, not Gemmini)
 - `ivit.RequantizeInt32`
+- `ivit.TwinSoftmaxMatMul` — flexi PTQ4ViT twin softmax×V (**Gemmini** int MM via `tiled_matmul_auto`)
+- `ivit.TwinGeluLinear` — flexi PTQ4ViT twin GELU linear (**Gemmini** int MM)
+
+FQ-DeiT Gemmini vs CPU map: see `docs/fq_deit_gemmini_map.md`.
+PTQ4ViT sync / iree note: see `docs/ptq4_sync_note.md`.
 
 Build:
 
