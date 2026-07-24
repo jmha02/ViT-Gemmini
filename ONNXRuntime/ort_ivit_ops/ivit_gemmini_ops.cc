@@ -533,7 +533,16 @@ inline int8_t twin_clamp_i8(float v, float lo, float hi) {
     return static_cast<int8_t>(std::min(std::max(r, lo), hi));
 }
 
-/* ── ivit.TwinSoftmaxMatMul (Gemmini int MM for hi/lo twins) ─────────────── */
+/* ── ivit.TwinSoftmaxMatMul ─────────────────────────────────────────────────
+ * Inputs (fused Softmax + twin quant + 2x Gemmini MM):
+ *   0: scores float [B,H,N,N]  (pre-softmax logits)
+ *   1: V      int8  [B,H,N,D]
+ *   2: split  float scalar
+ *   3: a_interval float scalar
+ *   4: bi     float [H]
+ *   5: attn_scale float scalar  (1/sqrt(head_dim); applied before Softmax)
+ * No RVV — scalar float Softmax matches ONNX Softmax axis=-1.
+ * ─────────────────────────────────────────────────────────────────────────── */
 struct TwinSoftmaxMatMulKernel {
     const OrtApi* ort;
 };
@@ -556,21 +565,23 @@ void ORT_API_CALL TwinSoftmaxMatMul_Compute(void* op_kernel, OrtKernelContext* c
     const OrtApi* ort = kernel->ort;
     const uint64_t profile_start = ort_profile_read_cycles();
 
-    const OrtValue* attn_v = nullptr;
+    const OrtValue* scores_v = nullptr;
     const OrtValue* v_v = nullptr;
     const OrtValue* split_v = nullptr;
     const OrtValue* ai_v = nullptr;
     const OrtValue* bi_v = nullptr;
-    ort->KernelContext_GetInput(ctx, 0, &attn_v);
+    const OrtValue* scale_v = nullptr;
+    ort->KernelContext_GetInput(ctx, 0, &scores_v);
     ort->KernelContext_GetInput(ctx, 1, &v_v);
     ort->KernelContext_GetInput(ctx, 2, &split_v);
     ort->KernelContext_GetInput(ctx, 3, &ai_v);
     ort->KernelContext_GetInput(ctx, 4, &bi_v);
+    ort->KernelContext_GetInput(ctx, 5, &scale_v);
 
-    const auto a_dims = get_dims(ort, attn_v);
+    const auto a_dims = get_dims(ort, scores_v);
     const auto v_dims = get_dims(ort, v_v);
     if (a_dims.size() != 4 || v_dims.size() != 4) {
-        throw std::runtime_error("TwinSoftmaxMatMul expects rank-4 attn and V");
+        throw std::runtime_error("TwinSoftmaxMatMul expects rank-4 scores and V");
     }
     const int64_t B = a_dims[0];
     const int64_t H = a_dims[1];
@@ -580,17 +591,19 @@ void ORT_API_CALL TwinSoftmaxMatMul_Compute(void* op_kernel, OrtKernelContext* c
         throw std::runtime_error("TwinSoftmaxMatMul shape mismatch");
     }
 
-    const float* attn = get_tensor_data<float>(ort, attn_v);
+    const float* scores = get_tensor_data<float>(ort, scores_v);
     const int8_t* V = get_tensor_data<int8_t>(ort, v_v);
     const float split = require_scalar_tensor_value<float>(ort, split_v, "split");
     const float a_interval = require_scalar_tensor_value<float>(ort, ai_v, "a_interval");
     const float* bi = get_tensor_data<float>(ort, bi_v);
+    const float attn_scale = require_scalar_tensor_value<float>(ort, scale_v, "attn_scale");
 
     const std::vector<int64_t> out_dims = {B, H, N, D};
     OrtValue* out_value = nullptr;
     ort->KernelContext_GetOutput(ctx, 0, out_dims.data(), out_dims.size(), &out_value);
     float* out = get_mutable_tensor_data<float>(ort, out_value);
 
+    std::vector<float> attn_row(static_cast<size_t>(N));
     std::vector<int8_t> q_hi(static_cast<size_t>(N * N));
     std::vector<int8_t> q_lo(static_cast<size_t>(N * N));
     std::vector<int32_t> acc_hi(static_cast<size_t>(N * D));
@@ -599,14 +612,29 @@ void ORT_API_CALL TwinSoftmaxMatMul_Compute(void* op_kernel, OrtKernelContext* c
 
     for (int64_t b = 0; b < B; ++b) {
         for (int64_t h = 0; h < H; ++h) {
-            const float* A = attn + ((b * H + h) * N) * N;
+            const float* S = scores + ((b * H + h) * N) * N;
             const int8_t* VV = V + ((b * H + h) * N) * D;
             float* O = out + ((b * H + h) * N) * D;
             const float bscale = bi[h];
 
             for (int64_t i = 0; i < N; ++i) {
+                // Softmax axis=-1 on scaled logits (matches ONNX Softmax).
+                float row_max = -std::numeric_limits<float>::infinity();
                 for (int64_t j = 0; j < N; ++j) {
-                    const float a = A[i * N + j];
+                    const float v = S[i * N + j] * attn_scale;
+                    if (v > row_max) {
+                        row_max = v;
+                    }
+                }
+                float sum = 0.0f;
+                for (int64_t j = 0; j < N; ++j) {
+                    const float e = std::exp(S[i * N + j] * attn_scale - row_max);
+                    attn_row[static_cast<size_t>(j)] = e;
+                    sum += e;
+                }
+                const float inv_sum = 1.0f / sum;
+                for (int64_t j = 0; j < N; ++j) {
+                    const float a = attn_row[static_cast<size_t>(j)] * inv_sum;
                     float hi_src = a < split ? split : a;
                     if (hi_src > 1.0f) {
                         hi_src = 1.0f;
@@ -615,7 +643,8 @@ void ORT_API_CALL TwinSoftmaxMatMul_Compute(void* op_kernel, OrtKernelContext* c
                     if (lo_src > split) {
                         lo_src = split;
                     }
-                    q_hi[static_cast<size_t>(i * N + j)] = twin_clamp_i8(hi_src * 127.0f, 0.0f, 127.0f);
+                    q_hi[static_cast<size_t>(i * N + j)] =
+                            twin_clamp_i8(hi_src * 127.0f, 0.0f, 127.0f);
                     q_lo[static_cast<size_t>(i * N + j)] =
                             twin_clamp_i8(lo_src / a_interval, 0.0f, 127.0f);
                 }
@@ -653,7 +682,7 @@ ONNXTensorElementDataType ORT_API_CALL TwinSoftmaxMatMul_GetInputType(
 }
 size_t ORT_API_CALL TwinSoftmaxMatMul_GetInputTypeCount(const OrtCustomOp* op) {
     (void)op;
-    return 5;
+    return 6;
 }
 ONNXTensorElementDataType ORT_API_CALL TwinSoftmaxMatMul_GetOutputType(
         const OrtCustomOp* op, size_t idx) {
@@ -695,7 +724,16 @@ OrtCustomOp make_twin_softmax_matmul_op() {
     return op;
 }
 
-/* ── ivit.TwinGeluLinear (Gemmini int MM for pos/neg twins) ──────────────── */
+/* ── ivit.TwinGeluLinear ────────────────────────────────────────────────────
+ * Inputs (fused Erf-GELU + twin quant + 2x Gemmini MM):
+ *   0: x   float  pre-GELU activations (fc1 out), rank >= 2
+ *   1: w   int8   [K, N] weight_q_t
+ *   2: a_interval float scalar
+ *   3: a_neg_interval float scalar
+ *   4: weight_scale float [N]
+ *   5: bias float [N]
+ * GELU: 0.5 * x * (1 + erf(x / sqrt(2)))  — same as torch nn.GELU / ONNX Erf form.
+ * ─────────────────────────────────────────────────────────────────────────── */
 struct TwinGeluLinearKernel {
     const OrtApi* ort;
 };
@@ -763,15 +801,18 @@ void ORT_API_CALL TwinGeluLinear_Compute(void* op_kernel, OrtKernelContext* ctx)
     std::vector<int8_t> q_neg(static_cast<size_t>(rows * K));
     std::vector<int32_t> acc_pos(static_cast<size_t>(rows * N));
     std::vector<int32_t> acc_neg(static_cast<size_t>(rows * N));
+    constexpr float kInvSqrt2 = 0.7071067811865476f;  // 1/sqrt(2)
 
     for (int64_t r = 0; r < rows; ++r) {
         const float* xr = x + r * K;
         for (int64_t k = 0; k < K; ++k) {
             const float xv = xr[k];
+            // Erf-GELU then twin split (matches export _gelu + TwinGeluLinear).
+            const float gelu = 0.5f * xv * (1.0f + std::erff(xv * kInvSqrt2));
             q_pos[static_cast<size_t>(r * K + k)] =
-                    twin_clamp_i8((xv > 0.0f ? xv : 0.0f) / a_interval, 0.0f, 127.0f);
+                    twin_clamp_i8((gelu > 0.0f ? gelu : 0.0f) / a_interval, 0.0f, 127.0f);
             q_neg[static_cast<size_t>(r * K + k)] =
-                    twin_clamp_i8((xv < 0.0f ? xv : 0.0f) / a_neg, -127.0f, 0.0f);
+                    twin_clamp_i8((gelu < 0.0f ? gelu : 0.0f) / a_neg, -127.0f, 0.0f);
         }
     }
 
@@ -845,6 +886,252 @@ OrtCustomOp make_twin_gelu_linear_op() {
     op.KernelDestroy = TwinGeluLinear_Destroy;
     op.GetInputCharacteristic = TwinGeluLinear_GetInputCharacteristic;
     op.GetOutputCharacteristic = TwinGeluLinear_GetOutputCharacteristic;
+    return op;
+}
+
+/* ── ivit.SymQuantizeI8: y = cast_i8(clip(round(x / scale), -128, 127)) ──── */
+struct SymQuantizeI8Kernel {
+    const OrtApi* ort;
+};
+
+void* ORT_API_CALL SymQuantizeI8_CreateKernel(
+        const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
+    (void)op;
+    (void)info;
+    auto* kernel = new SymQuantizeI8Kernel();
+    kernel->ort = api;
+    return kernel;
+}
+
+void ORT_API_CALL SymQuantizeI8_Destroy(void* op_kernel) {
+    delete static_cast<SymQuantizeI8Kernel*>(op_kernel);
+}
+
+void ORT_API_CALL SymQuantizeI8_Compute(void* op_kernel, OrtKernelContext* ctx) {
+    auto* kernel = static_cast<SymQuantizeI8Kernel*>(op_kernel);
+    const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+
+    const OrtValue* x_val = nullptr;
+    const OrtValue* scale_val = nullptr;
+    ort->KernelContext_GetInput(ctx, 0, &x_val);
+    ort->KernelContext_GetInput(ctx, 1, &scale_val);
+
+    const auto dims = get_dims(ort, x_val);
+    if (dims.empty()) {
+        throw std::runtime_error("SymQuantizeI8 expects rank >= 1");
+    }
+    const float scale = require_scalar_tensor_value<float>(ort, scale_val, "scale");
+    if (!(scale > 0.0f)) {
+        throw std::runtime_error("SymQuantizeI8 scale must be positive");
+    }
+    const float inv_scale = 1.0f / scale;
+    const float* x = get_tensor_data<float>(ort, x_val);
+    const int64_t n = numel(dims);
+
+    OrtValue* out_value = nullptr;
+    ort->KernelContext_GetOutput(ctx, 0, dims.data(), dims.size(), &out_value);
+    int8_t* out = get_mutable_tensor_data<int8_t>(ort, out_value);
+
+    for (int64_t i = 0; i < n; ++i) {
+        float v = std::nearbyintf(x[i] * inv_scale);
+        if (v > 127.0f) {
+            v = 127.0f;
+        } else if (v < -128.0f) {
+            v = -128.0f;
+        }
+        out[i] = static_cast<int8_t>(v);
+    }
+    ort_log_node_cycles(-1, "", "SymQuantizeI8", ort_profile_read_cycles() - profile_start);
+}
+
+const char* ORT_API_CALL SymQuantizeI8_GetName(const OrtCustomOp* op) {
+    (void)op;
+    return "SymQuantizeI8";
+}
+const char* ORT_API_CALL SymQuantizeI8_GetExecutionProviderType(const OrtCustomOp* op) {
+    (void)op;
+    return "CPUExecutionProvider";
+}
+ONNXTensorElementDataType ORT_API_CALL SymQuantizeI8_GetInputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL SymQuantizeI8_GetInputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 2;
+}
+ONNXTensorElementDataType ORT_API_CALL SymQuantizeI8_GetOutputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+}
+size_t ORT_API_CALL SymQuantizeI8_GetOutputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 1;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL SymQuantizeI8_GetInputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL SymQuantizeI8_GetOutputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+
+OrtCustomOp make_sym_quantize_i8_op() {
+    OrtCustomOp op{};
+    op.version = ORT_API_VERSION;
+    op.CreateKernel = SymQuantizeI8_CreateKernel;
+    op.GetName = SymQuantizeI8_GetName;
+    op.GetExecutionProviderType = SymQuantizeI8_GetExecutionProviderType;
+    op.GetInputType = SymQuantizeI8_GetInputType;
+    op.GetInputTypeCount = SymQuantizeI8_GetInputTypeCount;
+    op.GetOutputType = SymQuantizeI8_GetOutputType;
+    op.GetOutputTypeCount = SymQuantizeI8_GetOutputTypeCount;
+    op.KernelCompute = SymQuantizeI8_Compute;
+    op.KernelDestroy = SymQuantizeI8_Destroy;
+    op.GetInputCharacteristic = SymQuantizeI8_GetInputCharacteristic;
+    op.GetOutputCharacteristic = SymQuantizeI8_GetOutputCharacteristic;
+    return op;
+}
+
+/* ── ivit.FloatLayerNorm: float LN axis=-1 (no RVV) ─────────────────────────
+ * Inputs: x float [... , C], gamma float [C], beta float [C], eps float scalar
+ * ─────────────────────────────────────────────────────────────────────────── */
+struct FloatLayerNormKernel {
+    const OrtApi* ort;
+};
+
+void* ORT_API_CALL FloatLayerNorm_CreateKernel(
+        const OrtCustomOp* op, const OrtApi* api, const OrtKernelInfo* info) {
+    (void)op;
+    (void)info;
+    auto* kernel = new FloatLayerNormKernel();
+    kernel->ort = api;
+    return kernel;
+}
+
+void ORT_API_CALL FloatLayerNorm_Destroy(void* op_kernel) {
+    delete static_cast<FloatLayerNormKernel*>(op_kernel);
+}
+
+void ORT_API_CALL FloatLayerNorm_Compute(void* op_kernel, OrtKernelContext* ctx) {
+    auto* kernel = static_cast<FloatLayerNormKernel*>(op_kernel);
+    const OrtApi* ort = kernel->ort;
+    const uint64_t profile_start = ort_profile_read_cycles();
+
+    const OrtValue* x_val = nullptr;
+    const OrtValue* gamma_val = nullptr;
+    const OrtValue* beta_val = nullptr;
+    const OrtValue* eps_val = nullptr;
+    ort->KernelContext_GetInput(ctx, 0, &x_val);
+    ort->KernelContext_GetInput(ctx, 1, &gamma_val);
+    ort->KernelContext_GetInput(ctx, 2, &beta_val);
+    ort->KernelContext_GetInput(ctx, 3, &eps_val);
+
+    const auto dims = get_dims(ort, x_val);
+    if (dims.empty()) {
+        throw std::runtime_error("FloatLayerNorm expects rank >= 1");
+    }
+    const int64_t C = dims.back();
+    int64_t rows = 1;
+    for (size_t i = 0; i + 1 < dims.size(); ++i) {
+        rows *= dims[i];
+    }
+    const float* x = get_tensor_data<float>(ort, x_val);
+    const float* gamma = get_tensor_data<float>(ort, gamma_val);
+    const float* beta = get_tensor_data<float>(ort, beta_val);
+    const float eps = require_scalar_tensor_value<float>(ort, eps_val, "eps");
+
+    OrtValue* out_value = nullptr;
+    ort->KernelContext_GetOutput(ctx, 0, dims.data(), dims.size(), &out_value);
+    float* out = get_mutable_tensor_data<float>(ort, out_value);
+
+    for (int64_t r = 0; r < rows; ++r) {
+        const float* xr = x + r * C;
+        float* yr = out + r * C;
+        float mean = 0.0f;
+        for (int64_t c = 0; c < C; ++c) {
+            mean += xr[c];
+        }
+        mean /= static_cast<float>(C);
+        float var = 0.0f;
+        for (int64_t c = 0; c < C; ++c) {
+            const float d = xr[c] - mean;
+            var += d * d;
+        }
+        var /= static_cast<float>(C);
+        const float inv = 1.0f / std::sqrt(var + eps);
+        for (int64_t c = 0; c < C; ++c) {
+            yr[c] = (xr[c] - mean) * inv * gamma[c] + beta[c];
+        }
+    }
+    ort_log_node_cycles(-1, "", "FloatLayerNorm", ort_profile_read_cycles() - profile_start);
+}
+
+const char* ORT_API_CALL FloatLayerNorm_GetName(const OrtCustomOp* op) {
+    (void)op;
+    return "FloatLayerNorm";
+}
+const char* ORT_API_CALL FloatLayerNorm_GetExecutionProviderType(const OrtCustomOp* op) {
+    (void)op;
+    return "CPUExecutionProvider";
+}
+ONNXTensorElementDataType ORT_API_CALL FloatLayerNorm_GetInputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL FloatLayerNorm_GetInputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 4;
+}
+ONNXTensorElementDataType ORT_API_CALL FloatLayerNorm_GetOutputType(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+}
+size_t ORT_API_CALL FloatLayerNorm_GetOutputTypeCount(const OrtCustomOp* op) {
+    (void)op;
+    return 1;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL FloatLayerNorm_GetInputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+OrtCustomOpInputOutputCharacteristic ORT_API_CALL FloatLayerNorm_GetOutputCharacteristic(
+        const OrtCustomOp* op, size_t idx) {
+    (void)op;
+    (void)idx;
+    return INPUT_OUTPUT_REQUIRED;
+}
+
+OrtCustomOp make_float_layer_norm_op() {
+    OrtCustomOp op{};
+    op.version = ORT_API_VERSION;
+    op.CreateKernel = FloatLayerNorm_CreateKernel;
+    op.GetName = FloatLayerNorm_GetName;
+    op.GetExecutionProviderType = FloatLayerNorm_GetExecutionProviderType;
+    op.GetInputType = FloatLayerNorm_GetInputType;
+    op.GetInputTypeCount = FloatLayerNorm_GetInputTypeCount;
+    op.GetOutputType = FloatLayerNorm_GetOutputType;
+    op.GetOutputTypeCount = FloatLayerNorm_GetOutputTypeCount;
+    op.KernelCompute = FloatLayerNorm_Compute;
+    op.KernelDestroy = FloatLayerNorm_Destroy;
+    op.GetInputCharacteristic = FloatLayerNorm_GetInputCharacteristic;
+    op.GetOutputCharacteristic = FloatLayerNorm_GetOutputCharacteristic;
     return op;
 }
 
@@ -2471,6 +2758,8 @@ OrtCustomOp make_repq_uniform_matmul_op() {
 OrtCustomOp g_gemmini_matmul_integer_op{};
 OrtCustomOp g_twin_softmax_matmul_op{};
 OrtCustomOp g_twin_gelu_linear_op{};
+OrtCustomOp g_sym_quantize_i8_op{};
+OrtCustomOp g_float_layer_norm_op{};
 OrtCustomOp g_requantize_int32_op{};
 OrtCustomOp g_requantize_int32_to_int16_op{};
 OrtCustomOp g_requantize_int8_to_int16_op{};
@@ -2491,6 +2780,8 @@ void ensure_custom_ops_initialized() {
     g_gemmini_matmul_integer_op = make_gemmini_matmul_integer_op();
     g_twin_softmax_matmul_op = make_twin_softmax_matmul_op();
     g_twin_gelu_linear_op = make_twin_gelu_linear_op();
+    g_sym_quantize_i8_op = make_sym_quantize_i8_op();
+    g_float_layer_norm_op = make_float_layer_norm_op();
     g_requantize_int32_op = make_requantize_int32_op();
     g_requantize_int32_to_int16_op = make_requantize_int32_to_int16_op();
     g_requantize_int8_to_int16_op = make_requantize_int8_to_int16_op();
@@ -2523,6 +2814,14 @@ extern "C" OrtStatus* ORT_API_CALL AddIvitGemminiOps(
         return status;
     }
     status = ort->CustomOpDomain_Add(domain, &g_twin_gelu_linear_op);
+    if (status != nullptr) {
+        return status;
+    }
+    status = ort->CustomOpDomain_Add(domain, &g_sym_quantize_i8_op);
+    if (status != nullptr) {
+        return status;
+    }
+    status = ort->CustomOpDomain_Add(domain, &g_float_layer_norm_op);
     if (status != nullptr) {
         return status;
     }

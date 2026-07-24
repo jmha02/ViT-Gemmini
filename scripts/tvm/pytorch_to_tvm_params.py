@@ -286,14 +286,13 @@ def _build_swin_param_dict(model, depths):
     return renamed_params
 
 
-from models.ivit.fq_checkpoint import build_fq_param_dict
-
-
 def build_param_dict(model, depth=DEIT_DEPTH_DEFAULT, model_name=None):
     model = _as_state_dict(model)
     resolved_model = _resolve_model_name(model, model_name=model_name)
 
     if resolved_model in FQ_MODELS:
+        from models.ivit.fq_checkpoint import build_fq_param_dict
+
         return build_fq_param_dict(model)
     if resolved_model.startswith("deit_"):
         return _build_deit_param_dict(model, depth=depth)

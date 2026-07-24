@@ -166,8 +166,48 @@ def maybe_raise_stack_limit_for_build(model_name, opt_level):
     return soft, new_soft
 
 
-def preprocess_for_heterogeneous_gemmini(mod, model_name, canonicalize_qnn=False):
-    """Partition Gemmini matmuls for BYOC; leave CPU epilogues on LLVM host."""
+def rewrite_erf_to_fast_erf(mod):
+    """Rewrite Relay ``erf`` → ``fast_erf`` only (GELU), without full FastMath.
+
+    Softmax stays ``nn.softmax``; TOPI may still pick ``fast_softmax`` compute via
+    ``TVM_TOPI_VECTORIZABLE_ELEMWISE_MATH``. Avoids scalar ``erff`` without
+    ``relay.transform.FastMath()``.
+    """
+    from tvm.relay.dataflow_pattern import (
+        DFPatternCallback,
+        is_op,
+        rewrite,
+        wildcard,
+    )
+
+    class ErfToFastErf(DFPatternCallback):
+        def __init__(self):
+            super().__init__()
+            self.x = wildcard()
+            self.pattern = is_op("erf")(self.x)
+
+        def callback(self, pre, post, node_map):  # noqa: ARG002
+            return relay.Call(relay.op.get("fast_erf"), [node_map[self.x][0]])
+
+    new_main = rewrite(ErfToFastErf(), mod["main"])
+    mod.update_func(mod.get_global_var("main"), new_main)
+    return mod
+
+
+def preprocess_for_heterogeneous_gemmini(
+    mod, model_name, canonicalize_qnn=False, *, enable_fast_math=False
+):
+    """Partition Gemmini matmuls for BYOC; leave CPU epilogues on LLVM host.
+
+    When ``enable_fast_math`` is set, rewrite ``nn.softmax`` / ``exp`` / ``erf``
+    / ``tanh`` to polynomial ``nn.fast_softmax`` / ``fast_exp`` / ``fast_erf`` /
+    ``fast_tanh`` via ``relay.transform.FastMath()``.
+
+    Prefer the lighter path for RVV fair builds: set
+    ``TVM_TOPI_VECTORIZABLE_ELEMWISE_MATH=1`` and leave FastMath off. Then TOPI
+    uses ``fast_softmax`` for ``nn.softmax``, and we only rewrite ``erf``→
+    ``fast_erf`` for GELU — stock Softmax op in the graph, vectorizable math.
+    """
     if model_name.startswith("swin_"):
         pattern = relay.op.contrib.get_pattern_table("gemmini")
         mod = relay.transform.InferType()(mod)
@@ -185,13 +225,26 @@ def preprocess_for_heterogeneous_gemmini(mod, model_name, canonicalize_qnn=False
             mod = relay.qnn.transform.CanonicalizeOps()(mod)
             mod = relay.transform.FoldConstant()(mod)
             mod = relay.transform.InferType()(mod)
-        return mod
+    else:
+        mod = relay.transform.InferType()(mod)
+        mod = relay.transform.ConvertLayout({"qnn.conv2d": ["NHWC", "HWIO"]})(mod)
+        mod = relay.transform.SimplifyExpr()(mod)
+        mod = partition_for_gemmini(mod)
 
-    mod = relay.transform.InferType()(mod)
-    mod = relay.transform.ConvertLayout({"qnn.conv2d": ["NHWC", "HWIO"]})(mod)
-    mod = relay.transform.SimplifyExpr()(mod)
-    return partition_for_gemmini(mod)
-
+    if enable_fast_math:
+        mod = relay.transform.FastMath()(mod)
+        mod = relay.transform.InferType()(mod)
+    elif os.environ.get("TVM_TOPI_VECTORIZABLE_ELEMWISE_MATH", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        # GELU: erf → fast_erf. Softmax: kept as nn.softmax; TOPI strategy picks
+        # fast_softmax compute when the same env is set.
+        mod = rewrite_erf_to_fast_erf(mod)
+        mod = relay.transform.InferType()(mod)
+    return mod
 
 def preprocess_for_gemmini(mod, model_name, canonicalize_qnn=False):
     """Apply Gemmini preprocess with a lighter pipeline for large Swin graphs."""
@@ -438,6 +491,9 @@ def create_real_image_harness(
     print_str("\\n========================================\\n");
     print_str("Results\\n");
     print_str("========================================\\n");
+    print_str("[TVM_MAIN_INNER_CYCLES],");
+    print_dec(tvm_profile_main_cycles);
+    print_str("\\n");
     print_str("Cycles: ");
     print_dec(cycles);
     print_str("\\n");
@@ -488,6 +544,9 @@ def create_real_image_harness(
     print_str("\\n========================================\\n");
     print_str("Results\\n");
     print_str("========================================\\n");
+    print_str("[TVM_MAIN_INNER_CYCLES],");
+    print_dec(tvm_profile_main_cycles);
+    print_str("\\n");
     print_str("Cycles: ");
     print_dec(cycles);
     print_str("\\n");
@@ -572,6 +631,8 @@ static const uint8_t input_data[INPUT_SIZE_BYTES] __attribute__((aligned(16))) =
 static uint8_t output_data[TVMGEN_DEFAULT_OUTPUT_SIZE] __attribute__((aligned(16)));
 volatile uint64_t g_cycles = 0;
 volatile uint64_t g_checksum = 0;
+/* Weak: present when TVM main cycle instrumentation is linked in. */
+uint64_t tvm_profile_main_cycles __attribute__((weak)) = 0;
 
 int main() {{
 {spike_rvv_prologue}{prologue_code}
@@ -800,7 +861,9 @@ static inline uint64_t tvm_profile_read_cycles(void) {{
   return cycles;
 }}
 
-static uint64_t tvm_profile_main_cycles = 0;
+/* Non-static so the baremetal harness can print AFTER the timed region.
+ * Dumping UART inside tvmgen_default_run inflates FireSim TOTAL by ~10^8 cycles. */
+uint64_t tvm_profile_main_cycles = 0;
 
 static void tvm_profile_dump_main_cycles(void) {{
   tvm_profile_print_str("{inner_cycles_prefix}");
@@ -840,7 +903,6 @@ def instrument_tvm_main_total_cycles(output_dir):
             body
             + "\n  tvm_profile_main_cycles = "
             "tvm_profile_read_cycles() - __tvm_main_profile_start;"
-            "\n  tvm_profile_dump_main_cycles();"
             + tail
         )
 
@@ -883,7 +945,7 @@ def instrument_llvm_aot_main_total_cycles(output_dir):
   int32_t __tvm_main_status = tvmgen_default___tvm_main__(
       inputs->data, outputs->output, global_const_workspace, global_workspace);
   tvm_profile_main_cycles = tvm_profile_read_cycles() - __tvm_main_profile_start;
-  tvm_profile_dump_main_cycles();
+  /* Defer UART dump to harness post_run so FireSim TOTAL excludes print. */
   return __tvm_main_status;
 }"""
     updated, replaced = run_fn_re.subn(replacement, updated, count=1)
@@ -892,6 +954,402 @@ def instrument_llvm_aot_main_total_cycles(output_dir):
 
     shim_path.write_text(updated)
     print("[Fix] Instrumented llvm-gemmini tvm_main inner rdcycle dump")
+
+
+def _riscv_objdump_bin():
+    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
+    return f"{riscv}/bin/riscv64-unknown-elf-objdump"
+
+
+def _extract_llvm_tvm_main_call_names_from_object(obj_path):
+    """Recover tvm_main call order from CALL relocs inside tvm_main only."""
+    objdump = _riscv_objdump_bin()
+    nm = objdump.replace("objdump", "nm")
+
+    nm_result = subprocess.run(
+        [nm, str(obj_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if nm_result.returncode != 0:
+        raise RuntimeError(f"nm failed for {obj_path}: {nm_result.stderr}")
+
+    main_start = None
+    main_size = None
+    for line in nm_result.stdout.splitlines():
+        # e.g. 0000000000000000 T tvmgen_default___tvm_main__
+        parts = line.split()
+        if len(parts) >= 3 and parts[-1] == "tvmgen_default___tvm_main__":
+            main_start = int(parts[0], 16)
+            # Prefer size from `nm -S` when available.
+            break
+
+    nm_s = subprocess.run(
+        [nm, "-S", str(obj_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if nm_s.returncode == 0:
+        for line in nm_s.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[-1] == "tvmgen_default___tvm_main__":
+                main_start = int(parts[0], 16)
+                main_size = int(parts[1], 16)
+                break
+
+    if main_start is None:
+        raise RuntimeError(f"tvm_main symbol not found in {obj_path}")
+    if main_size is None:
+        # Fallback: disassemble and estimate until next global symbol.
+        main_size = 0x10000
+
+    main_end = main_start + main_size
+    reloc = subprocess.run(
+        [objdump, "-r", str(obj_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if reloc.returncode != 0:
+        raise RuntimeError(f"objdump -r failed for {obj_path}: {reloc.stderr}")
+
+    calls = []
+    for line in reloc.stdout.splitlines():
+        if "R_RISCV_CALL" not in line:
+            continue
+        addr_match = re.match(r"^([0-9a-fA-F]+)\s+", line)
+        sym_match = re.search(
+            r"(tvmgen_default_(?:fused_|gemmini_main_)[A-Za-z0-9_]+)",
+            line,
+        )
+        if not addr_match or not sym_match:
+            continue
+        addr = int(addr_match.group(1), 16)
+        if main_start <= addr < main_end:
+            calls.append(sym_match.group(1))
+
+    if not calls:
+        raise RuntimeError(f"No TVM kernel call relocations found in tvm_main of {obj_path}")
+    return calls
+
+
+def _extract_llvm_tvm_main_call_names_from_elf(elf_path):
+    objdump = _riscv_objdump_bin()
+    result = subprocess.run(
+        [objdump, "-d", str(elf_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"objdump -d failed for {elf_path}: {result.stderr}")
+
+    calls = []
+    in_main = False
+    for line in result.stdout.splitlines():
+        if re.match(r"^[0-9a-f]+ <tvmgen_default___tvm_main__>:", line):
+            in_main = True
+            continue
+        if in_main and re.match(r"^[0-9a-f]+ <", line):
+            break
+        if not in_main:
+            continue
+        match = re.search(
+            r"\bj(?:al|alr)\b.*<(tvmgen_default_(?:fused_|gemmini_main_)[^>]+)>",
+            line,
+        )
+        if match:
+            calls.append(match.group(1))
+    if not calls:
+        raise RuntimeError(f"No TVM kernel calls found in {elf_path} tvm_main")
+    return calls
+
+
+def _find_llvm_host_object(output_dir):
+    lib_dir = output_dir / "codegen" / "host" / "lib"
+    candidates = sorted(lib_dir.glob("default_lib*.o"))
+    for path in candidates:
+        try:
+            _extract_llvm_tvm_main_call_names_from_object(path)
+            return path
+        except RuntimeError:
+            continue
+    raise RuntimeError(f"Could not find LLVM host object with tvm_main under {lib_dir}")
+
+
+def prepare_llvm_host_object_for_wraps(obj_path, symbol_names):
+    """Rename defined fused_* bodies to __real_* and leave CALL relocs unresolved.
+
+    GNU ``--wrap`` only intercepts *undefined* references. Host fused kernels live in
+    the same LLVM object as ``tvm_main``, so their CALL_PLT relocs bind locally and
+    bypass wraps. Renaming the definitions makes those CALL sites undefined again.
+    """
+    try:
+        import lief
+    except ImportError as exc:
+        raise RuntimeError(
+            "llvm-gemmini kernel profiling requires the 'lief' package "
+            "(pip install lief) to rebind same-object CALL relocs for --wrap"
+        ) from exc
+
+    obj_path = pathlib.Path(obj_path)
+    binary = lief.parse(str(obj_path))
+    if binary is None:
+        raise RuntimeError(f"lief failed to parse {obj_path}")
+
+    renamed = []
+    for name in symbol_names:
+        sym = binary.get_symbol(name)
+        if sym is None:
+            continue
+        if int(sym.shndx) == 0:
+            continue  # already undefined (e.g. gemmini_main_* in default_lib0)
+        if sym.type != lief.ELF.Symbol.TYPE.FUNC:
+            continue
+        sym.name = f"__real_{name}"
+        undef = lief.ELF.Symbol()
+        undef.name = name
+        undef.type = lief.ELF.Symbol.TYPE.FUNC
+        undef.binding = lief.ELF.Symbol.BINDING.GLOBAL
+        undef.value = 0
+        undef.size = 0
+        binary.add_symtab_symbol(undef)
+        renamed.append(name)
+
+    by_name = {}
+    for sym in binary.symbols:
+        by_name.setdefault(sym.name, []).append(sym)
+
+    retargeted = 0
+    call_types = {
+        lief.ELF.Relocation.TYPE.RISCV_CALL,
+        lief.ELF.Relocation.TYPE.RISCV_CALL_PLT,
+    }
+    for reloc in binary.relocations:
+        if not reloc.has_symbol or reloc.type not in call_types:
+            continue
+        sym_name = reloc.symbol.name
+        if not sym_name.startswith("__real_"):
+            continue
+        orig = sym_name[len("__real_") :]
+        undefs = [cand for cand in by_name.get(orig, []) if int(cand.shndx) == 0]
+        if not undefs:
+            continue
+        reloc.symbol = undefs[0]
+        retargeted += 1
+
+    binary.write(str(obj_path))
+    print(
+        f"[Info] Prepared {obj_path.name} for --wrap "
+        f"(renamed={len(renamed)}, retargeted_calls={retargeted})"
+    )
+    return renamed
+
+
+def generate_llvm_kernel_profile_wraps(output_dir, model_name, *, debug_unit=None):
+    """Emit interposer stubs that rdcycle each llvm-gemmini fused/gemmini_main call.
+
+    Host fused kernels share an object with ``tvm_main``, so GNU ``--wrap`` cannot
+    intercept them. We rename those bodies to ``__real_*`` (LIEF) and provide strong
+    interposers under the original names.
+
+    ``gemmini_main_*`` lives in a separate C object, so plain ``--wrap`` works there.
+    """
+    host_obj = _find_llvm_host_object(output_dir)
+    call_names = _extract_llvm_tvm_main_call_names_from_object(host_obj)
+    fused_symbols = sorted({n for n in call_names if n.startswith("tvmgen_default_fused_")})
+    gemmini_symbols = sorted({n for n in call_names if n.startswith("tvmgen_default_gemmini_main_")})
+    prepare_llvm_host_object_for_wraps(host_obj, fused_symbols)
+    call_names = _extract_llvm_tvm_main_call_names_from_object(host_obj)
+    call_order_path = output_dir / "llvm_tvm_main_call_order.txt"
+    call_order_path.write_text(
+        "\n".join(f"{i+1},{name}" for i, name in enumerate(call_names)) + "\n"
+    )
+
+    _, semantic_segments, _ = _build_tvm_semantic_segments_from_call_names(
+        call_names, model_name, debug_unit=debug_unit
+    )
+    wrap_symbols = sorted(set(call_names))
+    kernel_names_initializer = ",\n".join(f'  "{name}"' for name in call_names)
+    segment_layer_initializer = ",\n".join(f'  "{segment["layer"]}"' for segment in semantic_segments)
+    segment_component_initializer = ",\n".join(
+        f'  "{segment["component"]}"' for segment in semantic_segments
+    )
+    segment_start_initializer = ", ".join(
+        str(segment["start_call"]) for segment in semantic_segments
+    )
+    segment_end_initializer = ", ".join(str(segment["end_call"]) for segment in semantic_segments)
+
+    wrap_decls = []
+    wrap_defs = []
+    for name in wrap_symbols:
+        use_gnu_wrap = name.startswith("tvmgen_default_gemmini_main_")
+        real_name = f"__real_{name}"
+        stub_name = f"__wrap_{name}" if use_gnu_wrap else name
+        wrap_decls.append(
+            f"int32_t {real_name}(void *a0, void *a1, void *a2, void *a3, "
+            f"void *a4, void *a5, void *a6, void *a7);"
+        )
+        wrap_defs.append(
+            f"""
+int32_t {stub_name}(void *a0, void *a1, void *a2, void *a3,
+                    void *a4, void *a5, void *a6, void *a7) {{
+  uint32_t __idx = tvm_profile_next_call_index++;
+  uint64_t __t0 = tvm_profile_read_cycles();
+  int32_t __status = {real_name}(a0, a1, a2, a3, a4, a5, a6, a7);
+  uint64_t __t1 = tvm_profile_read_cycles();
+  if (__idx < {len(call_names)}U) {{
+    tvm_profile_kernel_cycles[__idx] = __t1 - __t0;
+  }}
+  return __status;
+}}"""
+        )
+    wrap_decls = "\n".join(wrap_decls)
+
+    segment_count = max(1, len(semantic_segments))
+    source = f"""#include <stdint.h>
+
+extern volatile uint64_t tohost;
+extern volatile uint64_t fromhost;
+
+static void tvm_profile_print_char(char c) {{
+  volatile uint64_t magic_mem[8] __attribute__((aligned(64)));
+  magic_mem[0] = 64;
+  magic_mem[1] = 1;
+  magic_mem[2] = (uintptr_t)&c;
+  magic_mem[3] = 1;
+  __sync_synchronize();
+  tohost = (uintptr_t)magic_mem;
+  while (fromhost == 0);
+  fromhost = 0;
+  __sync_synchronize();
+}}
+
+static void tvm_profile_print_str(const char* s) {{
+  while (*s) tvm_profile_print_char(*s++);
+}}
+
+static void tvm_profile_print_dec(uint64_t val) {{
+  char buf[21];
+  int i = 20;
+  buf[i] = 0;
+  do {{
+    buf[--i] = '0' + (val % 10);
+    val /= 10;
+  }} while (val && i > 0);
+  tvm_profile_print_str(&buf[i]);
+}}
+
+static inline void tvm_profile_cycle_barrier(void) {{
+  asm volatile ("" ::: "memory");
+}}
+
+static inline uint64_t tvm_profile_read_cycles(void) {{
+  uint64_t cycles;
+  tvm_profile_cycle_barrier();
+  asm volatile ("rdcycle %0" : "=r" (cycles) : : "memory");
+  tvm_profile_cycle_barrier();
+  return cycles;
+}}
+
+static uint32_t tvm_profile_next_call_index = 0;
+static uint64_t tvm_profile_kernel_cycles[{len(call_names)}] = {{0}};
+static const char* tvm_profile_kernel_names[{len(call_names)}] = {{
+{kernel_names_initializer}
+}};
+static uint64_t tvm_profile_segment_cycles[{segment_count}] = {{0}};
+static const char* tvm_profile_segment_layers[{segment_count}] = {{
+{segment_layer_initializer if semantic_segments else '  ""'}
+}};
+static const char* tvm_profile_segment_components[{segment_count}] = {{
+{segment_component_initializer if semantic_segments else '  ""'}
+}};
+static const uint32_t tvm_profile_segment_start_calls[{segment_count}] = {{
+  {segment_start_initializer if semantic_segments else '0'}
+}};
+static const uint32_t tvm_profile_segment_end_calls[{segment_count}] = {{
+  {segment_end_initializer if semantic_segments else '0'}
+}};
+static const uint32_t tvm_profile_segment_count = {len(semantic_segments)};
+static const uint32_t tvm_profile_kernel_count = {len(call_names)};
+
+{wrap_decls}
+{''.join(wrap_defs)}
+
+void tvm_profile_dump_llvm_kernel_cycles(void) {{
+  for (uint32_t call_index = 0; call_index < tvm_profile_kernel_count; ++call_index) {{
+    tvm_profile_print_str("[TVM_KERNEL_CYCLES],");
+    tvm_profile_print_dec(call_index + 1);
+    tvm_profile_print_str(",");
+    tvm_profile_print_str(tvm_profile_kernel_names[call_index]);
+    tvm_profile_print_str(",");
+    tvm_profile_print_dec(tvm_profile_kernel_cycles[call_index]);
+    tvm_profile_print_str("\\n");
+  }}
+
+  for (uint32_t segment_index = 0; segment_index < tvm_profile_segment_count; ++segment_index) {{
+    uint64_t cycles = 0;
+    uint32_t start_call = tvm_profile_segment_start_calls[segment_index];
+    uint32_t end_call = tvm_profile_segment_end_calls[segment_index];
+    if (start_call >= 1 && end_call >= start_call && end_call <= tvm_profile_kernel_count) {{
+      for (uint32_t call_index = start_call - 1; call_index < end_call; ++call_index) {{
+        cycles += tvm_profile_kernel_cycles[call_index];
+      }}
+    }}
+    tvm_profile_segment_cycles[segment_index] = cycles;
+    tvm_profile_print_str("[TVM_SEMANTIC_CYCLES],");
+    tvm_profile_print_dec(segment_index + 1);
+    tvm_profile_print_str(",");
+    tvm_profile_print_str(tvm_profile_segment_layers[segment_index]);
+    tvm_profile_print_str(",");
+    tvm_profile_print_str(tvm_profile_segment_components[segment_index]);
+    tvm_profile_print_str(",");
+    tvm_profile_print_dec(start_call);
+    tvm_profile_print_str(",");
+    tvm_profile_print_dec(end_call);
+    tvm_profile_print_str(",");
+    tvm_profile_print_dec(cycles);
+    tvm_profile_print_str("\\n");
+  }}
+}}
+"""
+    wrap_path = output_dir / "codegen" / "host" / "src" / "llvm_kernel_profile_wraps.c"
+    wrap_path.write_text(source)
+    wrap_flags = [f"-Wl,--wrap={name}" for name in gemmini_symbols]
+    print(
+        f"[Info] Generated llvm-gemmini kernel profile wraps: {wrap_path} "
+        f"({len(call_names)} calls, fused_interpose={len(fused_symbols)}, "
+        f"gemmini_wrap={len(gemmini_symbols)})"
+    )
+    return wrap_path, wrap_flags, call_names
+
+
+def instrument_llvm_aot_kernel_cycle_dump(output_dir):
+    """Ask llvm shim to dump wrap-based kernel/semantic cycles after tvm_main."""
+    shim_path = output_dir / "codegen" / "host" / "src" / "llvm_aot_shim.c"
+    content = shim_path.read_text()
+    if "tvm_profile_dump_llvm_kernel_cycles" in content:
+        return
+
+    if "tvm_profile_dump_main_cycles();" not in content:
+        raise RuntimeError(
+            "llvm_aot_shim.c missing main cycle dump; call instrument_llvm_aot_main_total_cycles first"
+        )
+
+    decl = "\nvoid tvm_profile_dump_llvm_kernel_cycles(void);\n"
+    include_token = '#include "tvmgen_default.h"\n'
+    if include_token not in content:
+        raise RuntimeError(f"Could not find tvmgen_default include in {shim_path}")
+    content = content.replace(include_token, include_token + decl, 1)
+    content = content.replace(
+        "tvm_profile_dump_main_cycles();",
+        "tvm_profile_dump_llvm_kernel_cycles();\n  tvm_profile_dump_main_cycles();",
+        1,
+    )
+    shim_path.write_text(content)
+    print("[Fix] Instrumented llvm-gemmini kernel/semantic cycle dump in shim")
 
 
 def _extract_tvm_main_call_names_from_content(content):
@@ -909,6 +1367,7 @@ def _extract_tvm_main_call_names_from_content(content):
         return names
 
     raise RuntimeError("Could not extract TVM kernel call order from generated source")
+
 
 
 def _build_standalone_layer_ranges(call_names, model_name, debug_unit):
@@ -1410,7 +1869,7 @@ static void tvm_profile_dump_main_cycles(void) {{
     )
 
 
-def _instrument_spike_kernel_cycles(output_dir, model_name):
+def _instrument_spike_kernel_cycles(output_dir, model_name, debug_unit=None):
     """Wrap generated TVM callsites with kernel and semantic rdcycle profiling."""
     tvm_main_path = _find_tvm_main_source(output_dir)
     with open(tvm_main_path, "r") as f:
@@ -1426,7 +1885,7 @@ def _instrument_spike_kernel_cycles(output_dir, model_name):
 
     original_call_names = _extract_tvm_main_call_names_from_content(content)
     _, semantic_segments, _ = _build_tvm_semantic_segments_from_call_names(
-        original_call_names, model_name
+        original_call_names, model_name, debug_unit=debug_unit
     )
     segment_starts = defaultdict(list)
     segment_ends = defaultdict(list)
@@ -1919,10 +2378,10 @@ def fix_generated_code(
         # llvm-gemmini emits tvm_main into an LLVM object (default_lib1.o), so no split.
         split_oversized_tvm_main_for_riscv_link(output_dir)
 
-    if instrument_kernel_cycles:
-        _instrument_spike_kernel_cycles(output_dir, model_name)
+    if instrument_kernel_cycles and not llvm_gemmini:
+        _instrument_spike_kernel_cycles(output_dir, model_name, debug_unit=debug_unit)
         _instrument_spike_intrakernel_head(output_dir)
-    elif segment_profile_style is not None:
+    elif segment_profile_style is not None and not llvm_gemmini:
         _instrument_tvm_segment_cycles(
             output_dir,
             model_name,
@@ -1931,7 +2390,7 @@ def fix_generated_code(
             component_filters=segment_profile_component_filters,
             debug_unit=debug_unit,
         )
-    if instrument_requant_intrakernel:
+    if instrument_requant_intrakernel and not llvm_gemmini:
         _instrument_intrakernel_requant_kernels(output_dir)
 
 
@@ -2044,10 +2503,28 @@ def extract_spike_intrakernel_cycle_rows(stdout):
 
 
 def _load_tvm_main_call_names(output_dir):
-    tvm_main_path = _find_tvm_main_source(output_dir)
-    with open(tvm_main_path, "r") as f:
-        content = f.read()
-    return _extract_tvm_main_call_names_from_content(content)
+    call_order_path = pathlib.Path(output_dir) / "llvm_tvm_main_call_order.txt"
+    if call_order_path.exists():
+        names = []
+        for line in call_order_path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "," in line:
+                names.append(line.split(",", 1)[1].strip())
+            else:
+                names.append(line)
+        if names:
+            return names
+
+    try:
+        tvm_main_path = _find_tvm_main_source(output_dir)
+        with open(tvm_main_path, "r") as f:
+            content = f.read()
+        return _extract_tvm_main_call_names_from_content(content)
+    except RuntimeError:
+        host_obj = _find_llvm_host_object(output_dir)
+        return _extract_llvm_tvm_main_call_names_from_object(host_obj)
 
 
 def _matches_generated_name(name, base_name):
@@ -2076,7 +2553,12 @@ def _layernorm_sequence_length(call_names, start_index):
         return 4
 
     if start_index + 3 < len(call_names) and (
-        _matches_generated_name(call_names[start_index], "tvmgen_default_fused_cast_mean")
+        (
+            _matches_generated_name(call_names[start_index], "tvmgen_default_fused_cast_mean")
+            or _matches_generated_name(
+                call_names[start_index], "tvmgen_default_fused_cast_cast_mean"
+            )
+        )
         and (
             _matches_generated_name(
                 call_names[start_index + 1], "tvmgen_default_fused_round_cast_subtract"
@@ -2094,8 +2576,13 @@ def _layernorm_sequence_length(call_names, start_index):
 
     if start_index + 4 < len(call_names) and (
         _matches_generated_name(call_names[start_index], "tvmgen_default_fused_cast")
-        and _matches_generated_name(
-            call_names[start_index + 1], "tvmgen_default_fused_cast_mean"
+        and (
+            _matches_generated_name(
+                call_names[start_index + 1], "tvmgen_default_fused_cast_mean"
+            )
+            or _matches_generated_name(
+                call_names[start_index + 1], "tvmgen_default_fused_cast_cast_mean"
+            )
         )
         and (
             _matches_generated_name(
@@ -2490,9 +2977,97 @@ def _is_layernorm_sequence(call_names, start_index):
 
 
 def _is_gemm_kernel(name):
-    return name.startswith("tvmgen_default_fused_contrib_gemmini_gemm") or name.startswith(
-        "tvmgen_default_fused_nn_dense"
+    return (
+        name.startswith("tvmgen_default_fused_contrib_gemmini_gemm")
+        or name.startswith("tvmgen_default_fused_nn_dense")
+        or name.startswith("tvmgen_default_gemmini_main_")
     )
+
+
+def _gemmini_main_index(name):
+    match = re.fullmatch(r"tvmgen_default_gemmini_main_(\d+)", name)
+    return int(match.group(1)) if match else None
+
+
+def _is_llvm_gemmini_call_names(call_names):
+    return any(name.startswith("tvmgen_default_gemmini_main_") for name in call_names)
+
+
+def _classify_llvm_ivit_block_kernel(name):
+    """Heuristic component label for llvm-gemmini I-ViT DeiT block kernels."""
+    gemm_idx = _gemmini_main_index(name)
+    if gemm_idx is not None:
+        if gemm_idx == 0:
+            return "qkv"
+        if gemm_idx in (3, 6, 9):
+            return "attn_scores"
+        if gemm_idx in (12, 15, 18):
+            return "attn_v"
+        if gemm_idx == 21:
+            return "proj"
+        if gemm_idx == 24:
+            return "fc1"
+        if gemm_idx == 27:
+            return "fc2"
+        return "matmul"
+
+    if _matches_generated_name(name, "tvmgen_default_fused_cast_cast_mean") or _matches_generated_name(
+        name, "tvmgen_default_fused_cast_mean"
+    ):
+        return "layernorm"
+    if _matches_generated_name(name, "tvmgen_default_fused_cast_round_cast_subtract") or _matches_generated_name(
+        name, "tvmgen_default_fused_round_cast_subtract"
+    ):
+        return "layernorm"
+    if _matches_generated_name(name, "tvmgen_default_fused_multiply_sum"):
+        return "layernorm"
+    if _is_divide_norm_kernel(name):
+        return "layernorm"
+    if name.startswith("tvmgen_default_fused_max"):
+        return "softmax"
+    if name.startswith(
+        "tvmgen_default_fused_subtract_right_shift_add_right_shift_subtract_maximum_divide_multiply"
+    ):
+        return "softmax"
+    if name.startswith(
+        "tvmgen_default_fused_divide_multiply_add_right_shift_cast_reshape"
+    ):
+        return "softmax"
+    if name.startswith(
+        "tvmgen_default_fused_cast_subtract_right_shift_add_right_shift_subtract_maximum_divide_multiply"
+    ):
+        return "gelu"
+    if "fixed_point_multiply_per_axis_clip_cast_reshape_cast_multiply" in name:
+        return "resadd"
+    if "fixed_point_multiply_per_axis" in name:
+        return "requant"
+    if any(
+        token in name
+        for token in ("reshape", "transpose", "squeeze", "expand_dims", "layout_transform", "concatenate")
+    ):
+        return "layout"
+    if "cast" in name:
+        return "requant"
+    return "misc"
+
+
+def _parse_llvm_ivit_transformer_block_component_segments(call_names):
+    """Component segments for llvm-gemmini I-ViT graphs (partially inlined LN)."""
+    segments = []
+    if not call_names:
+        return segments
+
+    current = _classify_llvm_ivit_block_kernel(call_names[0])
+    start = 0
+    for idx in range(1, len(call_names)):
+        label = _classify_llvm_ivit_block_kernel(call_names[idx])
+        if label == current:
+            continue
+        _append_component_segment(segments, start, idx - 1, current)
+        start = idx
+        current = label
+    _append_component_segment(segments, start, len(call_names) - 1, current)
+    return segments
 
 
 def _is_layernorm_kernel_name(name):
@@ -2501,6 +3076,9 @@ def _is_layernorm_kernel_name(name):
         or _matches_generated_name(name, "tvmgen_default_fused_subtract")
         or _matches_generated_name(name, "tvmgen_default_fused_multiply_cast_sum")
         or _matches_generated_name(name, "tvmgen_default_fused_multiply_mean")
+        or _matches_generated_name(name, "tvmgen_default_fused_cast_mean")
+        or _matches_generated_name(name, "tvmgen_default_fused_cast_cast_mean")
+        or _matches_generated_name(name, "tvmgen_default_fused_multiply_sum")
         or _is_repq_layernorm_tail_kernel(name)
         or _is_divide_norm_kernel(name)
     )
@@ -2691,6 +3269,8 @@ def _parse_repq_transformer_block_component_segments(call_names):
 def _parse_transformer_block_component_segments(call_names):
     if _is_repq_graph_call_names(call_names):
         return _parse_repq_transformer_block_component_segments(call_names)
+    if _is_llvm_gemmini_call_names(call_names):
+        return _parse_llvm_ivit_transformer_block_component_segments(call_names)
 
     segments = []
     idx = 0
@@ -2830,6 +3410,8 @@ def _parse_aligned_component_segments(layer_name, model_name, call_names, split_
         return _parse_repq_aligned_transformer_block_component_segments(
             layer_name, model_name, call_names
         )
+    if _is_llvm_gemmini_call_names(call_names):
+        return _parse_llvm_ivit_transformer_block_component_segments(call_names)
     return _parse_aligned_transformer_block_component_segments(
         layer_name, model_name, call_names, split_post_ops=split_post_ops
     )
@@ -4142,6 +4724,7 @@ def compile_for_spike_llvm_gemmini(
     *,
     riscv_march="rv64gc",
     gcc_opt_level=2,
+    extra_link_flags=None,
 ):
     """Link precompiled LLVM host objects + Gemmini C sources for Spike."""
     repo_root = pathlib.Path(__file__).resolve().parents[2]
@@ -4238,6 +4821,7 @@ def compile_for_spike_llvm_gemmini(
         + cflags
         + object_files
         + ["-o", str(output_binary), "-lm", "-lgcc", "-Wl,--relax"]
+        + list(extra_link_flags or [])
     )
     print(f"[Compile] Linking llvm-gemmini Spike binary ({len(llvm_objects)} LLVM objects)...")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -4722,10 +5306,60 @@ def main():
         ),
     )
     parser.add_argument(
+        "--llvm-no-loop-vectorize",
+        action="store_true",
+        help=(
+            "With llvm-gemmini: disable LLVM LoopVectorize/SLP "
+            "(-vectorize-loops=false -vectorize-slp=false). Use with "
+            "--llvm-tir-vectorize so RVV comes only from TIR VectorizeLoop lowering."
+        ),
+    )
+    parser.add_argument(
+        "--llvm-tir-max-vf",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap TE/TIR injective vectorize factor (sets TVM_TOPI_INJECTIVE_MAX_VF). "
+            "For Swin e2e + --llvm-tir-vectorize, default becomes 16 if unset."
+        ),
+    )
+    parser.add_argument(
+        "--llvm-opt-level",
+        type=int,
+        default=None,
+        choices=[0, 1, 2, 3],
+        help=(
+            "LLVM Target opt-level for llvm-gemmini host (default 3). "
+            "For Swin e2e + --llvm-tir-vectorize, default becomes 2 if unset."
+        ),
+    )
+    parser.add_argument(
+        "--dump-tir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Dump final lowered TIR PrimFuncs (phase-3, pre-codegen) into DIR. "
+            "Use with --llvm-tir-vectorize on/off to compare ramp/broadcast vs scalar."
+        ),
+    )
+    parser.add_argument(
         "--llvm-rvv",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable RVV (+v,+zvl512b) LLVM autovec on host epilogues (llvm-gemmini; Saturn/FireSim)",
+    )
+    parser.add_argument(
+        "--llvm-fast-math",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "With llvm-gemmini: run Relay FastMath (softmax/exp/erf/tanh → polynomial "
+            "fast_* ops) so TIR VectorizeLoop and LLVM RVV can vectorize float "
+            "epilogues instead of scalar libm expf/erff. Default on; use "
+            "--no-llvm-fast-math for libm ablation."
+        ),
     )
     parser.add_argument(
         "--build-only",
@@ -5064,19 +5698,93 @@ def main():
                 "Rebuild tvm-gemmini with USE_GEMMINI=ON (see docs/tvm_path_b_plan.md)."
             )
             return 1
+        enable_fast_math = bool(args.llvm_fast_math)
         print(
             f"       TVM backend: llvm-gemmini "
-            f"(RVV={args.llvm_rvv}, tir_vectorize={args.llvm_tir_vectorize})"
+            f"(RVV={args.llvm_rvv}, tir_vectorize={args.llvm_tir_vectorize}, "
+            f"llvm_loop_vectorize={not args.llvm_no_loop_vectorize}, "
+            f"fast_math={enable_fast_math})"
         )
+        # Swin e2e + full VF=64 previously hung LLVM (~128GB RSS, 5h+). Cap VF / opt.
+        llvm_opt_level = args.llvm_opt_level
+        tir_max_vf = args.llvm_tir_max_vf
+        if args.llvm_tir_vectorize and model_name.startswith("swin_"):
+            if tir_max_vf is None:
+                tir_max_vf = 16
+            if llvm_opt_level is None:
+                llvm_opt_level = 2
+        if tir_max_vf is not None:
+            os.environ["TVM_TOPI_INJECTIVE_MAX_VF"] = str(int(tir_max_vf))
+            print(f"       TIR injective max VF cap: {tir_max_vf}")
+        if llvm_opt_level is None:
+            llvm_opt_level = 3
+        # Fair autovec (match IREE ``--lmul 0`` + GenericVectorization style):
+        # - no pinned LLVM LMUL; TE tile default LMUL=1 (VLEN/SEW)
+        # - awkward axes (Softmax 197) stay contiguous → LLVM masked vp.reduce
+        # - injective TE.vectorize ON: TVM analog of IREE GenericVectorization
+        #   (structured auto-vec, not hand microkernels). Softmax/LN still force
+        #   te_vectorize=False in their schedules.
+        # FastMath (PTQ4): poly Softmax/GELU so float epilogues vectorize; does
+        # not change the TE-VF policy above.
+        if args.llvm_rvv:
+            if "TVM_TOPI_FAIR_AUTOVEC" not in os.environ:
+                os.environ["TVM_TOPI_FAIR_AUTOVEC"] = "1"
+            te_lmul = os.environ.get("TVM_TOPI_INJECTIVE_LMUL", "1").strip() or "1"
+            llvm_lmul = os.environ.get("TVM_LLVM_RVV_LMUL", "").strip() or "omit"
+            print(
+                f"       TIR/LLVM LMUL: TE={te_lmul}, "
+                f"LLVM flag={llvm_lmul} (fair default: TE=1, LLVM omit)"
+            )
+        if args.llvm_tir_vectorize:
+            if "TVM_TOPI_INJECTIVE_TE_VECTORIZE" not in os.environ:
+                # Default ON: structured injective VF ≈ IREE GenericVectorization.
+                os.environ["TVM_TOPI_INJECTIVE_TE_VECTORIZE"] = "1"
+            te_vf = os.environ.get("TVM_TOPI_INJECTIVE_TE_VECTORIZE", "1")
+            print(
+                f"       Fair autovec: TE-VF(injective)={te_vf}, "
+                "awkward Softmax/LN reduces → LLVM (IREE-like)"
+            )
+            if enable_fast_math:
+                print("       FastMath: on (poly Softmax/GELU via Relay FastMath)")
+            else:
+                # Without Relay FastMath: still make Softmax/GELU vectorizable via
+                # TOPI fast_softmax + erf→fast_erf (IREE-like math approx at TE).
+                if "TVM_TOPI_VECTORIZABLE_ELEMWISE_MATH" not in os.environ:
+                    os.environ["TVM_TOPI_VECTORIZABLE_ELEMWISE_MATH"] = "1"
+                print(
+                    "       FastMath: off; vectorizable elemwise math "
+                    "(TOPI fast_softmax + erf→fast_erf, no Relay FastMath)"
+                )
         mod = preprocess_for_heterogeneous_gemmini(
-            mod, model_name, canonicalize_qnn=canonicalize_qnn
+            mod,
+            model_name,
+            canonicalize_qnn=canonicalize_qnn,
+            enable_fast_math=enable_fast_math,
         )
     else:
         print("       TVM backend: c-gemmini")
         mod = preprocess_for_gemmini(mod, model_name, canonicalize_qnn=canonicalize_qnn)
+        llvm_opt_level = 3
     mod = relay.transform.InferType()(mod)
     if use_llvm_gemmini:
-        llvm_target = llvm_riscv_target(enable_rvv=args.llvm_rvv)
+        llvm_target = llvm_riscv_target(
+            enable_rvv=args.llvm_rvv,
+            disable_ipo_inline=bool(args.profile_kernels),
+            opt_level=int(llvm_opt_level),
+            disable_loop_vectorize=bool(args.llvm_no_loop_vectorize),
+        )
+        print(f"       LLVM target opt-level: {llvm_opt_level}")
+        if args.llvm_no_loop_vectorize:
+            print(
+                "       LLVM LoopVectorize/SLP: OFF "
+                "(-vectorize-loops=false -vectorize-slp=false); "
+                "TIR VectorizeLoop RVV lowering kept if --llvm-rvv"
+            )
+        if args.profile_kernels:
+            print(
+                "       llvm-gemmini profile: disable IPO inline "
+                "(-inline-threshold=0) so host kernels stay callable"
+            )
         gemmini_target = tvm.target.Target("gemmini", host=llvm_target)
         mod["main"] = bind_params_by_name(mod["main"], tvm_params)
         mod = relay.transform.InferType()(mod)
@@ -5094,13 +5802,48 @@ def main():
     if disabled_passes:
         print(f"       disabled_pass={disabled_passes}")
 
+    dump_tir_extra_config = {}
+    tir_dump_staging = None
+    tir_dump_final = None
+    tir_dump_counter = {"i": 0}
+    if args.dump_tir:
+        import tempfile
+
+        tir_dump_final = pathlib.Path(args.dump_tir).resolve()
+        # Dump to a staging dir first: export step does rmtree(output_dir), which
+        # would delete dumps if --dump-tir points inside --output-dir.
+        tir_dump_staging = pathlib.Path(
+            tempfile.mkdtemp(prefix="tvm_tir_dump_")
+        )
+        tir_dump_dir = tir_dump_staging
+
+        @tvm.tir.transform.prim_func_pass(opt_level=0)
+        def _dump_tir_primfunc(f, mod, ctx):  # noqa: ARG001
+            idx = tir_dump_counter["i"]
+            tir_dump_counter["i"] = idx + 1
+            sym = "func"
+            if f.attrs is not None and "global_symbol" in f.attrs:
+                sym = str(f.attrs["global_symbol"])
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", sym)[:120]
+            path = tir_dump_dir / f"{idx:04d}_{safe}.tir"
+            path.write_text(str(f))
+            return f
+
+        # phase 3 = after VectorizeLoop / Unroll / Simplify, immediately before codegen
+        dump_tir_extra_config = {"tir.add_lower_pass": [[3, _dump_tir_primfunc]]}
+        print(f"       TIR dump (staging): {tir_dump_staging}")
+        print(f"       TIR dump (final):   {tir_dump_final}")
+
     if use_llvm_gemmini:
-        build_ctx = gemmini.heterogeneous_build_config(
+        build_ctx_kwargs = dict(
             usmp_alg=usmp_alg,
             opt_level=opt_level,
             disabled_pass=disabled_passes,
             enable_tir_vectorize=bool(args.llvm_tir_vectorize),
         )
+        if dump_tir_extra_config:
+            build_ctx_kwargs["config"] = dump_tir_extra_config
+        build_ctx = gemmini.heterogeneous_build_config(**build_ctx_kwargs)
         build_kwargs = dict(
             executor=EXECUTOR,
             runtime=RUNTIME,
@@ -5109,9 +5852,14 @@ def main():
         )
     else:
         TARGET = tvm.target.target.Target({"kind": "c", "device": "gemmini"})
-        build_ctx = gemmini.build_config(
-            usmp_alg=usmp_alg, opt_level=opt_level, disabled_pass=disabled_passes
+        build_ctx_kwargs = dict(
+            usmp_alg=usmp_alg,
+            opt_level=opt_level,
+            disabled_pass=disabled_passes,
         )
+        if dump_tir_extra_config:
+            build_ctx_kwargs["config"] = dump_tir_extra_config
+        build_ctx = gemmini.build_config(**build_ctx_kwargs)
         build_kwargs = dict(
             executor=EXECUTOR, runtime=RUNTIME, target=TARGET, params=tvm_params
         )
@@ -5126,6 +5874,15 @@ def main():
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if tir_dump_staging is not None and tir_dump_final is not None:
+        if tir_dump_final.exists():
+            shutil.rmtree(tir_dump_final)
+        tir_dump_final.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tir_dump_staging), str(tir_dump_final))
+        print(
+            f"       TIR dump complete: {tir_dump_counter['i']} PrimFuncs -> {tir_dump_final}"
+        )
 
     mlf_path = output_dir / "model.tar"
     tvm.micro.export_model_library_format(module, mlf_path)
@@ -5147,13 +5904,16 @@ def main():
     if use_llvm_gemmini:
         generate_llvm_aot_shim(output_dir, module)
         instrument_llvm_aot_main_total_cycles(output_dir)
-        count_rvv_instructions(output_dir, object_name="default_lib1.o")
-        if args.build_only:
-            print(
-                "[Info] llvm-gemmini build-only complete. "
-                "LLVM objects: codegen/host/lib/*.o"
+        llvm_profile_link_flags = []
+        if args.profile_kernels and args.simulator == "spike":
+            _, llvm_profile_link_flags, _ = generate_llvm_kernel_profile_wraps(
+                output_dir,
+                model_name,
+                debug_unit=args.debug_unit,
             )
-            return 0
+            instrument_llvm_aot_kernel_cycle_dump(output_dir)
+        count_rvv_instructions(output_dir, object_name="default_lib1.o")
+        # Continue to harness + link so --build-only still produces a FireSim ELF.
 
     if not use_llvm_gemmini:
         instrument_tvm_main_total_cycles(output_dir)
@@ -5183,6 +5943,7 @@ def main():
             "ivit_real",
             riscv_march=link_march,
             gcc_opt_level=args.gcc_opt_level,
+            extra_link_flags=llvm_profile_link_flags,
         )
     else:
         compile_label = (
@@ -5289,7 +6050,11 @@ def main():
             print(f"[Info] Spike kernel cycle CSV: {csv_path}")
             print(f"[Info] Spike kernel cycle report: {txt_path}")
             aligned_rows = build_spike_segment_cycle_rows(
-                output_dir, model_name, kernel_rows, style="aligned"
+                output_dir,
+                model_name,
+                kernel_rows,
+                style="aligned",
+                debug_unit=args.debug_unit,
             )
             (
                 aligned_segment_csv_path,

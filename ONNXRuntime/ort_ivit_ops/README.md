@@ -12,8 +12,10 @@ graphs:
 - `ivit.FQLISSoftmax` — flexi FQ-DeiT log-domain softmax (CPU)
 - `ivit.FQAttnVMatMul` — flexi FQ-DeiT Attn@V shift reduction (CPU, not Gemmini)
 - `ivit.RequantizeInt32`
-- `ivit.TwinSoftmaxMatMul` — flexi PTQ4ViT twin softmax×V (**Gemmini** int MM via `tiled_matmul_auto`)
-- `ivit.TwinGeluLinear` — flexi PTQ4ViT twin GELU linear (**Gemmini** int MM)
+- `ivit.TwinSoftmaxMatMul` — PTQ4ViT: fused float Softmax(+scale) + twin quant + **Gemmini** int MM (`tiled_matmul_auto`). Inputs: scores `[B,H,N,N]`, V int8 `[B,H,N,D]`, split, a_interval, bi`[H]`, attn_scale. **No RVV.**
+- `ivit.TwinGeluLinear` — PTQ4ViT: fused Erf-GELU + twin quant + **Gemmini** int MM. Input0 is **pre-GELU** activations. **No RVV.**
+- `ivit.SymQuantizeI8` — `cast_i8(clip(round(x/scale), -128, 127))` (replaces Div/Round/Clip/Cast chains)
+- `ivit.FloatLayerNorm` — float LN `axis=-1` (gamma, beta, eps); same math as ReduceMean chain. **No RVV.**
 
 FQ-DeiT Gemmini vs CPU map: see `docs/fq_deit_gemmini_map.md`.
 PTQ4ViT sync / iree note: see `docs/ptq4_sync_note.md`.

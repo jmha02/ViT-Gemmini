@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Export flexi-faithful PTQ4-DeiT ONNX (float LN/Softmax/GELU + GemminiMatMulInteger + Twin ops)."""
+"""Export flexi-faithful PTQ4-DeiT ONNX.
+
+Float LN / Softmax / GELU stay mathematically identical to flexi PTQ4ViT, but
+are fused into ivit customs to cut ORT dispatch (no RVV in ORT kernels):
+
+  - ivit.FloatLayerNorm
+  - ivit.SymQuantizeI8
+  - ivit.TwinSoftmaxMatMul  (Softmax + twin + Gemmini MM)
+  - ivit.TwinGeluLinear     (Erf-GELU + twin + Gemmini MM)
+  - ivit.GemminiMatMulInteger
+"""
 
 from __future__ import annotations
 
@@ -40,15 +50,12 @@ def _arr(sd, key, dtype=np.float32):
 
 
 def _q_sym_i8(g: OnnxBuilder, x: str, scale: float, name: str) -> str:
-    s = g.scalar_f32(f"{name}_s", float(scale))
-    div = g.add("Div", [x, s], [f"{name}_div"])
-    rnd = g.add("Round", [div], [f"{name}_rnd"])
-    clipped = g.add(
-        "Clip",
-        [rnd, g.scalar_f32(f"{name}_lo", -128.0), g.scalar_f32(f"{name}_hi", 127.0)],
-        [f"{name}_clip"],
+    return g.add_custom(
+        "SymQuantizeI8",
+        "ivit",
+        [x, g.scalar_f32(f"{name}_s", float(scale))],
+        [f"{name}_i8"],
     )
-    return g.add("Cast", [clipped], [f"{name}_i8"], to=TensorProto.INT8)
 
 
 def _int_mm_linear(
@@ -81,27 +88,24 @@ def _int_mm_linear(
 
 
 def _layer_norm(g: OnnxBuilder, x: str, sd, prefix: str, dim: int, name: str) -> str:
-    """Float LayerNorm via ReduceMean primitives (opset 13; no com.microsoft LN)."""
+    """Float LayerNorm via fused ivit.FloatLayerNorm (same math as ReduceMean chain)."""
     w = _vec(sd, f"{prefix}.weight")
     b = _vec(sd, f"{prefix}.bias")
-    # opset-13 ReduceMean takes axes as attribute (not input).
-    mean = g.add("ReduceMean", [x], [f"{name}_mean"], axes=[-1], keepdims=1)
-    centered = g.add("Sub", [x, mean], [f"{name}_centered"])
-    sq = g.add("Mul", [centered, centered], [f"{name}_sq"])
-    var = g.add("ReduceMean", [sq], [f"{name}_var"], axes=[-1], keepdims=1)
-    eps = g.scalar_f32(f"{name}_eps", 1e-5)
-    inv = g.add(
-        "Reciprocal",
-        [g.add("Sqrt", [g.add("Add", [var, eps], [f"{name}_veps"])], [f"{name}_std"])],
-        [f"{name}_inv"],
+    return g.add_custom(
+        "FloatLayerNorm",
+        "ivit",
+        [
+            x,
+            g.init_tensor(f"{name}_w", w),
+            g.init_tensor(f"{name}_b", b),
+            g.scalar_f32(f"{name}_eps", 1e-5),
+        ],
+        [f"{name}_out"],
     )
-    normed = g.add("Mul", [centered, inv], [f"{name}_normed"])
-    scaled = g.add("Mul", [normed, g.init_tensor(f"{name}_w", w)], [f"{name}_scaled"])
-    return g.add("Add", [scaled, g.init_tensor(f"{name}_b", b)], [f"{name}_out"])
 
 
 def _gelu(g: OnnxBuilder, x: str, name: str) -> str:
-    # Erf form for onnxruntime-riscv (opset 13 / IR 7); avoid Gelu (opset 20).
+    # Kept for reference; MLP path absorbs Erf-GELU into TwinGeluLinear.
     inv_sqrt2 = g.scalar_f32(f"{name}_is2", float(np.sqrt(0.5)))
     half = g.scalar_f32(f"{name}_half", 0.5)
     one = g.scalar_f32(f"{name}_one", 1.0)
@@ -204,9 +208,7 @@ def _attention(g: OnnxBuilder, x: str, sd, prefix: str, *, dim: int, num_heads: 
     q, k, v = _qkv_split(g, x, sd, f"{prefix}.attn.qkv", dim=dim, num_heads=num_heads, seq=seq, name=f"{name}_qkv")
     scores = _qk_matmul(g, q, k, sd, f"{prefix}.attn.matmul1", num_heads=num_heads, seq=seq, head_dim=head_dim, name=f"{name}_mm1")
     scale = float(head_dim ** -0.5)
-    scores_s = g.add("Mul", [scores, g.scalar_f32(f"{name}_sm_s", scale)], [f"{name}_scores_s"])
-    attn = g.add("Softmax", [scores_s], [f"{name}_attn"], axis=-1)
-    # TwinSoftmaxMatMul custom op
+    # TwinSoftmaxMatMul absorbs Softmax(+scale) + twin quant + 2x Gemmini MM.
     split = _scalar(sd, f"{prefix}.attn.matmul2.split")
     a_interval = _scalar(sd, f"{prefix}.attn.matmul2.a_interval")
     b_interval = _vec(sd, f"{prefix}.attn.matmul2.b_interval")
@@ -214,11 +216,12 @@ def _attention(g: OnnxBuilder, x: str, sd, prefix: str, *, dim: int, num_heads: 
         "TwinSoftmaxMatMul",
         "ivit",
         [
-            attn,
+            scores,
             v,
             g.scalar_f32(f"{name}_split", split),
             g.scalar_f32(f"{name}_ai", a_interval),
             g.init_tensor(f"{name}_bi", b_interval),
+            g.scalar_f32(f"{name}_sm_s", scale),
         ],
         [f"{name}_ctx"],
     )
@@ -248,22 +251,13 @@ def _mlp(g: OnnxBuilder, x: str, sd, prefix: str, *, dim: int, mlp_ratio: int, s
         lead_shape=[1, seq],
         name=f"{name}_fc1",
     )
-    # Erf GELU for broad ORT compatibility
-    inv_sqrt2 = g.scalar_f32(f"{name}_is2", float(np.sqrt(0.5)))
-    half = g.scalar_f32(f"{name}_half", 0.5)
-    one = g.scalar_f32(f"{name}_one", 1.0)
-    scaled = g.add("Mul", [h, inv_sqrt2], [f"{name}_gs"])
-    erf = g.add("Erf", [scaled], [f"{name}_erf"])
-    term = g.add("Add", [one, erf], [f"{name}_term"])
-    half_x = g.add("Mul", [half, h], [f"{name}_hx"])
-    gelu = g.add("Mul", [half_x, term], [f"{name}_gelu"])
-    # TwinGeluLinear
+    # TwinGeluLinear absorbs Erf-GELU + twin quant + 2x Gemmini MM.
     w = _arr(sd, f"{prefix}.mlp.fc2.weight_q_t", np.int8)
     return g.add_custom(
         "TwinGeluLinear",
         "ivit",
         [
-            gelu,
+            h,
             g.init_tensor(f"{name}_w", w),
             g.scalar_f32(f"{name}_ai", _scalar(sd, f"{prefix}.mlp.fc2.a_interval")),
             g.scalar_f32(f"{name}_an", _scalar(sd, f"{prefix}.mlp.fc2.a_neg_interval")),
