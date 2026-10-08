@@ -1,15 +1,28 @@
 # ViT-Gemmini
 
-Minimal workspace for three Gemmini-targeted flows:
+Gemmini-targeted experiment workspace. The main I-ViT/PTQ4 model paths are:
 
 - `I-ViT DeiT-Tiny`
+- `I-ViT DeiT-Small`
 - `I-ViT Swin-Tiny`
-- `RepQ-ViT DeiT-Tiny`
+- `PTQ4ViT DeiT-Tiny`
+
+The workspace also retains the `RepQ-ViT DeiT-Tiny` smoke flow.
 
 Supported export/runtime paths:
 
 - `TVM -> Gemmini Spike`
 - `ONNX Runtime -> Gemmini Spike`
+
+The TVM runner supports I-ViT DeiT-Tiny/Small and Swin-Tiny checkpoints, plus
+the Flexi PTQ4ViT DeiT-Tiny checkpoint. Run the paired vectorized TVM comparison
+with `scripts/gemmini/run_vfrec7_matrix.sh`; it compiles each workload once with
+`TVM_LLVM_VFREC7` unset and once with `TVM_LLVM_VFREC7=1`. The paired run keeps
+TIR vectorization, LLVM/RVV settings, inputs, and checkpoints constant. Set
+`FLEXI_EVAL_ROOT` to the `eval/` directory from the Flexi checkout for PTQ4ViT.
+The smoke script still uses generated random I-ViT weights and is only a
+toolchain check; use real matching checkpoints for accuracy and performance
+comparisons.
 
 ## Layout
 
