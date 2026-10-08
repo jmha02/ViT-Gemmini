@@ -59,6 +59,22 @@ SATURN_SPIKE_ISA = "rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm"
 SATURN_LINK_MARCH = "rv64gcv_zvl512b_zicntr_zicsr"
 
 
+def _riscv_toolchain_root():
+    """Resolve the RISC-V toolchain from explicit environment configuration."""
+    riscv = os.environ.get("RISCV")
+    if riscv:
+        return pathlib.Path(riscv).expanduser().resolve()
+    chipyard = os.environ.get("CHIPYARD_DIR")
+    if chipyard:
+        candidate = pathlib.Path(chipyard).expanduser() / ".conda-env" / "riscv-tools"
+        if candidate.is_dir():
+            return candidate.resolve()
+    raise RuntimeError(
+        "Set RISCV to the RISC-V toolchain directory or CHIPYARD_DIR to a "
+        "Chipyard checkout containing .conda-env/riscv-tools."
+    )
+
+
 def riscv_march_enables_v(march: str) -> bool:
     """True if march enables the V (or Zve*) vector extension.
 
@@ -957,8 +973,7 @@ def instrument_llvm_aot_main_total_cycles(output_dir):
 
 
 def _riscv_objdump_bin():
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
-    return f"{riscv}/bin/riscv64-unknown-elf-objdump"
+    return str(_riscv_toolchain_root() / "bin" / "riscv64-unknown-elf-objdump")
 
 
 def _extract_llvm_tvm_main_call_names_from_object(obj_path):
@@ -4431,7 +4446,7 @@ def fix_gemmini_includes(output_dir):
     import re
 
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root.parent / "tvm-gemmini"))
     gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
     gemmini_include = pathlib.Path(gemmini_rocc_tests) / "include"
 
@@ -4632,8 +4647,7 @@ int32_t tvmgen_default_run(
 
 def count_rvv_instructions(output_dir, *, object_name="default_lib1.o"):
     """Count RVV instructions in a precompiled LLVM object via objdump."""
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
-    objdump = f"{riscv}/bin/riscv64-unknown-elf-objdump"
+    objdump = _riscv_objdump_bin()
     obj_path = output_dir / "codegen" / "host" / "lib" / object_name
     if not obj_path.exists():
         print(f"[WARN] RVV check skipped; object not found: {obj_path}")
@@ -4728,13 +4742,13 @@ def compile_for_spike_llvm_gemmini(
 ):
     """Link precompiled LLVM host objects + Gemmini C sources for Spike."""
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root.parent / "tvm-gemmini"))
+    riscv = _riscv_toolchain_root()
 
     gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
     riscv_tests = f"{gemmini_rocc_tests}/riscv-tests"
     bench_common = f"{riscv_tests}/benchmarks/common"
-    cc = f"{riscv}/bin/riscv64-unknown-elf-gcc"
+    cc = str(riscv / "bin" / "riscv64-unknown-elf-gcc")
 
     codegen_dir = output_dir / "codegen" / "host"
     lib_dir = codegen_dir / "lib"
@@ -4844,14 +4858,14 @@ def compile_for_spike(
 ):
     """Compile for Spike."""
     repo_root = pathlib.Path(__file__).resolve().parents[2]
-    tvm_home = os.environ.get("TVM_HOME", str(repo_root / "tvm-gemmini"))
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
+    tvm_home = os.environ.get("TVM_HOME", str(repo_root.parent / "tvm-gemmini"))
+    riscv = _riscv_toolchain_root()
 
     gemmini_rocc_tests = f"{tvm_home}/3rdparty/gemmini/software/gemmini-rocc-tests"
     riscv_tests = f"{gemmini_rocc_tests}/riscv-tests"
     bench_common = f"{riscv_tests}/benchmarks/common"
 
-    cc = f"{riscv}/bin/riscv64-unknown-elf-gcc"
+    cc = str(riscv / "bin" / "riscv64-unknown-elf-gcc")
 
     codegen_dir = output_dir / "codegen" / "host"
     fixed_include = fix_gemmini_includes(output_dir)
@@ -4935,16 +4949,18 @@ def compile_for_spike(
 
 def run_spike(binary_path, timeout=600, spike_isa=None):
     """Run on Spike."""
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
-    spike = f"{riscv}/bin/spike"
-    chipyard_lib = "/root/flexi/chipyard/.conda-env/lib"
+    riscv = _riscv_toolchain_root()
+    spike = riscv / "bin" / "spike"
+    chipyard_dir = os.environ.get("CHIPYARD_DIR")
+    chipyard_lib = pathlib.Path(chipyard_dir) / ".conda-env" / "lib" if chipyard_dir else None
 
     env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = f"{chipyard_lib}:{env.get('LD_LIBRARY_PATH', '')}"
+    if chipyard_lib and chipyard_lib.is_dir():
+        env["LD_LIBRARY_PATH"] = f"{chipyard_lib}:{env.get('LD_LIBRARY_PATH', '')}"
     if "LD_PRELOAD" in env:
         del env["LD_PRELOAD"]
 
-    cmd = [spike]
+    cmd = [str(spike)]
     if spike_isa:
         cmd.append(f"--isa={spike_isa}")
     cmd.extend(["--extension=gemmini", str(binary_path)])
@@ -4967,7 +4983,7 @@ def run_spike(binary_path, timeout=600, spike_isa=None):
 def run_verilator(
     binary_path,
     timeout=600,
-    chipyard_dir="/root/flexi/chipyard",
+    chipyard_dir=None,
     verilator_config="BigRocketSaturnGemminiConfig",
     max_cycles=20000000000,
     dramsim=True,
@@ -4976,6 +4992,9 @@ def run_verilator(
     log_tail_lines=20000,
 ):
     """Run on Chipyard Verilator simulator."""
+    chipyard_dir = chipyard_dir or os.environ.get("CHIPYARD_DIR")
+    if not chipyard_dir:
+        raise RuntimeError("Set CHIPYARD_DIR or pass --chipyard-dir to use Verilator.")
     simulator = (
         pathlib.Path(chipyard_dir)
         / "sims"
@@ -5091,8 +5110,7 @@ def run_verilator(
 
 
 def _resolve_riscv_tool(tool_name):
-    riscv = os.environ.get("RISCV", "/root/flexi/chipyard/.conda-env/riscv-tools")
-    return pathlib.Path(riscv) / "bin" / tool_name
+    return _riscv_toolchain_root() / "bin" / tool_name
 
 
 def decode_trace_with_spike_dasm(trace_path, decoded_path):
@@ -5217,7 +5235,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run I-ViT on real image")
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument(
-        "--checkpoint", type=str, default="/root/checkpoint_last.pth.tar"
+        "--checkpoint", type=str, default=os.environ.get("IVIT_CHECKPOINT")
     )
     parser.add_argument(
         "--allow-random-init",
@@ -5257,7 +5275,7 @@ def main():
     parser.add_argument(
         "--chipyard-dir",
         type=str,
-        default="/root/flexi/chipyard",
+        default=os.environ.get("CHIPYARD_DIR"),
         help="Chipyard root path (used for Verilator)",
     )
     parser.add_argument(
@@ -5541,10 +5559,10 @@ def main():
     )
 
     print("\n[1/6] Loading checkpoint...")
-    checkpoint_path = pathlib.Path(args.checkpoint).expanduser()
+    checkpoint_path = pathlib.Path(args.checkpoint).expanduser() if args.checkpoint else None
     requested_model_name = None if args.model_name == "auto" else args.model_name
     if (
-        not checkpoint_path.exists()
+        (checkpoint_path is None or not checkpoint_path.exists())
         and not args.allow_random_init
         and not (requested_model_name and requested_model_name.startswith("ptq4_deit_"))
     ):
@@ -5610,7 +5628,7 @@ def main():
         skip_common_load = False
 
     if not skip_common_load:
-      if checkpoint_path.exists():
+      if checkpoint_path is not None and checkpoint_path.exists():
         ckpt = torch.load(str(checkpoint_path), map_location="cpu")
         model_name = convert_model.resolve_model_name(ckpt, requested_model_name)
       else:
@@ -5626,7 +5644,9 @@ def main():
 
       depth = MODEL_SPECS[model_name]["depth"]
       convert_model.load_qconfig(ckpt, depth=depth, model_name=model_name)
-      print(f"       Checkpoint: {checkpoint_path if checkpoint_path.exists() else '<random-init>'}")
+      print(
+          f"       Checkpoint: {checkpoint_path if checkpoint_path and checkpoint_path.exists() else '<random-init>'}"
+      )
       print(f"       Model: {model_name}")
 
       input_scale = None

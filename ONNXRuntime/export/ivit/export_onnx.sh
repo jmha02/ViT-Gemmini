@@ -4,8 +4,8 @@
 # Supports both DeiT-Tiny and Swin-Tiny.
 #
 # Usage examples:
-#   ONNXRuntime/export/ivit/export_onnx.sh --model-name deit_tiny_patch16_224 --checkpoint /root/checkpoint_last.pth.tar
-#   ONNXRuntime/export/ivit/export_onnx.sh --model-name swin_tiny_patch4_window7_224 --checkpoint /root/swin_checkpoint.pth.tar
+#   ONNXRuntime/export/ivit/export_onnx.sh --model-name deit_tiny_patch16_224 --checkpoint "$IVIT_CHECKPOINT"
+#   ONNXRuntime/export/ivit/export_onnx.sh --model-name swin_tiny_patch4_window7_224 --checkpoint "$SWIN_CHECKPOINT"
 #
 # Note:
 #   Swin uses custom-op exporter by default (DeiT-style I-ViT graph).

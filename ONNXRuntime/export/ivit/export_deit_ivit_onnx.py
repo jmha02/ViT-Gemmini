@@ -24,8 +24,8 @@ Custom ops (ivit domain):          ivit.QLayernorm, ivit.QLayernormInt16, ivit.S
 
 Usage:
     cd third-party/I-ViT-Gemmini
-    python3 ONNXRuntime/export/ivit/export_deit_ivit_onnx.py --checkpoint /root/checkpoint_last.pth.tar
-    python3 ONNXRuntime/export/ivit/export_deit_ivit_onnx.py --checkpoint /root/checkpoint_last.pth.tar --verify
+    python3 ONNXRuntime/export/ivit/export_deit_ivit_onnx.py --checkpoint "$IVIT_CHECKPOINT"
+    python3 ONNXRuntime/export/ivit/export_deit_ivit_onnx.py --checkpoint "$IVIT_CHECKPOINT" --verify
 """
 
 import argparse
@@ -51,7 +51,7 @@ from ivit_model_io import create_model, load_checkpoint_state_dict
 # ── Paths ─────────────────────────────────────────────────────────────────────
 OUTPUT_DIR = REPO_ROOT / "build" / "ort"
 OUTPUT_ONNX = OUTPUT_DIR / "ivit_tiny_int8.onnx"
-DEFAULT_CKPT    = "/root/checkpoint_last.pth.tar"
+DEFAULT_CKPT = os.environ.get("IVIT_CHECKPOINT")
 DEFAULT_IMAGE = REPO_ROOT / "scripts" / "gemmini" / "test_cat.jpg"
 DEFAULT_HOST_CUSTOM_OP_LIB = REPO_ROOT / "build" / "ort" / "ort_ivit_ops" / "libivit_ops_host.so"
 
@@ -1150,7 +1150,7 @@ def main():
         choices=SUPPORTED_MODEL_NAMES,
         help="I-ViT DeiT model variant",
     )
-    parser.add_argument("--checkpoint", default=None,
+    parser.add_argument("--checkpoint", default=DEFAULT_CKPT,
                         help="I-ViT QAT checkpoint (checkpoint_last.pth.tar)")
     parser.add_argument("--output",     default=OUTPUT_ONNX,
                         help="Output ONNX path")

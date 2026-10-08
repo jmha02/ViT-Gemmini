@@ -14,14 +14,10 @@ export VIT_GEMMINI_ROOT
 
 if [[ -z "${TVM_HOME:-}" ]]; then
     if [[ -d "${VIT_GEMMINI_ROOT}/tvm-gemmini" ]]; then
-        export TVM_HOME="${VIT_GEMMINI_ROOT}/tvm-gemmini"
-    elif [[ -d "/root/flexi/third-party/I-ViT-Gemmini/tvm-gemmini" ]]; then
-        export TVM_HOME="/root/flexi/third-party/I-ViT-Gemmini/tvm-gemmini"
+        export TVM_HOME="$(cd "${VIT_GEMMINI_ROOT}/tvm-gemmini" && pwd -P)"
+    elif [[ -d "${VIT_GEMMINI_ROOT}/../tvm-gemmini" ]]; then
+        export TVM_HOME="$(cd "${VIT_GEMMINI_ROOT}/../tvm-gemmini" && pwd -P)"
     fi
-fi
-
-if [[ -z "${CHIPYARD_DIR:-}" && -d "/root/flexi/chipyard" ]]; then
-    export CHIPYARD_DIR="/root/flexi/chipyard"
 fi
 
 if [[ -z "${RISCV:-}" && -n "${CHIPYARD_DIR:-}" && -d "${CHIPYARD_DIR}/.conda-env/riscv-tools" ]]; then

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import torch
 
-FLEXI_SPECS = Path("/root/flexi/eval/specs")
+FLEXI_EVAL_ROOT = Path(
+    os.environ.get("FLEXI_EVAL_ROOT", Path(__file__).resolve().parents[2] / "eval")
+).expanduser()
+FLEXI_SPECS = FLEXI_EVAL_ROOT / "specs"
+if not FLEXI_SPECS.is_dir():
+    raise RuntimeError(f"PTQ4 model specs not found at {FLEXI_SPECS}; set FLEXI_EVAL_ROOT.")
 if str(FLEXI_SPECS) not in sys.path:
     sys.path.insert(0, str(FLEXI_SPECS))
 

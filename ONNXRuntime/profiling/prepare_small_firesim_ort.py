@@ -10,6 +10,7 @@ success cases, use the quantized image boundary. This script extracts
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from onnx import TensorProto
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_FLEXI_ROOT = Path("/root/flexi/third-party/I-ViT-Gemmini")
+DEFAULT_FLEXI_ROOT = Path(os.environ.get("VIT_GEMMINI_ROOT", REPO_ROOT)).expanduser()
 
 
 def _read_tvm_input(main_c: Path) -> bytes:

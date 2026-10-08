@@ -22,7 +22,7 @@ sys.path.insert(0, str(TVM_SCRIPTS_DIR))
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(REPO_ROOT))
 
-TVM_HOME = Path(os.environ.get("TVM_HOME", REPO_ROOT / "tvm-gemmini"))
+TVM_HOME = Path(os.environ.get("TVM_HOME", REPO_ROOT.parent / "tvm-gemmini"))
 TVM_PYTHON = TVM_HOME / "python"
 if str(TVM_PYTHON) not in sys.path:
     sys.path.insert(0, str(TVM_PYTHON))
@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--chipyard-dir",
-        default=os.environ.get("CHIPYARD_DIR", "/root/flexi/chipyard"),
+        default=os.environ.get("CHIPYARD_DIR"),
         help="Chipyard root path (used for Verilator)",
     )
     parser.add_argument(

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
-DEFAULT_PTQ4_DEIT_T_CHECKPOINT = Path("/root/flexi/eval/data/ptq4_deit_t/e2e_model.pt")
-DEFAULT_PTQ4_DEIT_T_INPUT = Path("/root/flexi/eval/data/ptq4_deit_t/model_input.f32.bin")
-DEFAULT_PTQ4_DEIT_T_OUTPUT = Path("/root/flexi/eval/data/ptq4_deit_t/model_output.f32.bin")
+FLEXI_EVAL_ROOT = Path(
+    os.environ.get("FLEXI_EVAL_ROOT", Path(__file__).resolve().parents[2] / "eval")
+).expanduser()
+DEFAULT_PTQ4_DEIT_T_CHECKPOINT = FLEXI_EVAL_ROOT / "data/ptq4_deit_t/e2e_model.pt"
+DEFAULT_PTQ4_DEIT_T_INPUT = FLEXI_EVAL_ROOT / "data/ptq4_deit_t/model_input.f32.bin"
+DEFAULT_PTQ4_DEIT_T_OUTPUT = FLEXI_EVAL_ROOT / "data/ptq4_deit_t/model_output.f32.bin"
 
 
 def load_ptq4_state_dict(path: str | Path) -> dict:
@@ -61,9 +65,13 @@ def random_ptq4_state_dict(
 ) -> dict:
     """Random-init state_dict matching flexi PTQ4VisionTransformer layout."""
     import sys
-    from pathlib import Path as P
 
-    sys.path.insert(0, str(P("/root/flexi/eval/specs")))
+    specs_dir = FLEXI_EVAL_ROOT / "specs"
+    if not specs_dir.is_dir():
+        raise RuntimeError(
+            f"PTQ4 model specs not found at {specs_dir}; set FLEXI_EVAL_ROOT."
+        )
+    sys.path.insert(0, str(specs_dir))
     import ptq4_deit as M  # noqa: WPS433
 
     torch.manual_seed(seed)

@@ -30,16 +30,19 @@ Heavy infrastructure is kept external on purpose.
 - `CHIPYARD_DIR`: Chipyard checkout with Spike/pk/toolchain
 - `RISCV`: optional; defaults to `${CHIPYARD_DIR}/.conda-env/riscv-tools`
 - `ORT_RISCV_DIR`: optional; defaults to `${TVM_HOME}/3rdparty/gemmini/software/onnxruntime-riscv`
+- `IVIT_CHECKPOINT`: optional default for commands that accept an I-ViT checkpoint
+- `FLEXI_EVAL_ROOT`: optional external Flexi evaluation data/specs path for PTQ4 flows
 
-In this environment, the defaults in `env.sh` resolve to the existing `flexi` checkouts.
-`env.sh` also pins the Chipyard `libstdc++` runtime so TVM Python bindings load
-cleanly from the base conda environment.
+The sibling `tvm-gemmini` checkout is detected automatically when this repository
+is used as a submodule beside it. Set `CHIPYARD_DIR` explicitly; the script does
+not assume a machine-specific Chipyard location. `env.sh` adds the selected TVM
+Python package and libraries to the current shell.
 
 ## Setup
 
 ```bash
-cd /root/ViT-Gemmini
-source env.sh
+cd /path/to/flexi_baseline/ViT-Gemmini
+source ./env.sh
 ```
 
 ## End-To-End Smoke
@@ -56,12 +59,13 @@ This generates random I-ViT checkpoints for smoke testing, exports:
 and then runs Spike for all of them.
 
 ```bash
-cd /root/ViT-Gemmini
-source env.sh
+cd /path/to/flexi_baseline/ViT-Gemmini
+source ./env.sh
 bash scripts/smoke_all.sh
 ```
 
-Validated in this environment on `2026-04-22`.
+The smoke flow uses generated random checkpoints and is intended to check the
+toolchain and runners. It is not an accuracy or paper-performance result.
 
 - `build/ort/ivit_deit_tiny_int8.onnx`
 - `build/ort/ivit_swin_tiny_int8.onnx`
@@ -69,6 +73,9 @@ Validated in this environment on `2026-04-22`.
 - `build/tvm/deit/`
 - `build/tvm/swin/`
 - `build/tvm/repq_deit/`
+
+Generated checkpoints, exported models, logs, and build products stay under
+ignored `build/` directories and are not stored in Git.
 
 Notes:
 

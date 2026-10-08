@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -15,7 +16,7 @@ from onnx import TensorProto
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_FLEXI_ROOT = Path("/root/flexi/third-party/I-ViT-Gemmini")
+DEFAULT_FLEXI_ROOT = Path(os.environ.get("VIT_GEMMINI_ROOT", REPO_ROOT)).expanduser()
 EXTRACTOR = DEFAULT_FLEXI_ROOT / "ONNXRuntime" / "profiling" / "extract_onnx_prefix.py"
 
 

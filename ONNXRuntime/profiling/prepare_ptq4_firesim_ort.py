@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import onnx
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ONNX = REPO_ROOT / "build/ort/ptq4_deit_tiny_int8.onnx"
-DEFAULT_INPUT = Path("/root/flexi/eval/data/ptq4_deit_t/model_input.f32.bin")
+DEFAULT_INPUT = Path(os.environ["PTQ4_DEIT_INPUT"]).expanduser() if os.environ.get("PTQ4_DEIT_INPUT") else None
 DEFAULT_OUT = REPO_ROOT / "build/ort_ptq4_firesim_artifacts/ort_ptq4_deit/only_full"
 
 
@@ -26,6 +27,8 @@ def main() -> None:
 
     if not args.onnx.is_file():
         raise SystemExit(f"ONNX not found: {args.onnx} (run export_ptq4_deit_onnx.py first)")
+    if args.input_bin is None:
+        raise SystemExit("Pass --input-bin or set PTQ4_DEIT_INPUT to the f32 input file.")
     if not args.input_bin.is_file():
         raise SystemExit(f"input bin not found: {args.input_bin}")
 

@@ -1,6 +1,7 @@
 # ORT Repro
 
-This is the minimal reproducible path for the ONNX Runtime flow.
+This is the minimal reproducible path for the ONNX Runtime flow. It assumes the
+external Chipyard toolchain is installed and an I-ViT checkpoint is available.
 If you are preparing RTL baselines, use this file first and treat the other
 validation helpers as optional support tools.
 
@@ -28,10 +29,19 @@ Fresh Spike logs were generated under `build/ort/repro/`:
 - `build/ort/repro/repq_deit_spike_x1.log`
 - `build/ort/repro/repq_swin_spike_x1.log`
 
+These filenames record the validation run; generated models and logs are not
+checked into Git. Recreate them with the steps below and supply the matching
+external checkpoints.
+
 ## 1) Build
 
 ```bash
-cd /root/flexi/third-party/I-ViT-Gemmini
+cd /path/to/flexi_baseline/ViT-Gemmini
+export CHIPYARD_DIR=/path/to/chipyard
+export RISCV="${CHIPYARD_DIR}/.conda-env/riscv-tools"
+export IVIT_CHECKPOINT=/path/to/ivit-checkpoint.pth.tar
+export SWIN_CHECKPOINT=/path/to/swin-checkpoint.pth.tar
+source ./env.sh
 ONNXRuntime/build/build_ort_riscv.sh
 ```
 
@@ -49,7 +59,7 @@ This builds:
 ```bash
 ONNXRuntime/export/ivit/export_onnx.sh \
   --model-name deit_tiny_patch16_224 \
-  --checkpoint /root/ivit-deit-t.pth.tar \
+  --checkpoint "$IVIT_CHECKPOINT" \
   --output build/ort/repro/ivit_deit_tiny_int8.onnx
 ```
 
@@ -58,7 +68,7 @@ ONNXRuntime/export/ivit/export_onnx.sh \
 ```bash
 ONNXRuntime/export/ivit/export_onnx.sh \
   --model-name swin_tiny_patch4_window7_224 \
-  --checkpoint /data/checkpoint.pth.tar \
+  --checkpoint "$SWIN_CHECKPOINT" \
   --output build/ort/repro/ivit_swin_tiny_int8.onnx
 ```
 
@@ -175,14 +185,14 @@ nm -C tvm-gemmini/3rdparty/gemmini/software/onnxruntime-riscv/systolic_runner/im
 Check that the custom-op compute paths call `gemmini_matmul_int32`:
 
 ```bash
-/root/flexi/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-objdump \
+"${RISCV}/bin/riscv64-unknown-linux-gnu-objdump" \
   -d --demangle \
   --disassemble='(anonymous namespace)::GemminiMatMulInteger_Compute(void*, OrtKernelContext*)' \
   tvm-gemmini/3rdparty/gemmini/software/onnxruntime-riscv/systolic_runner/imagenet_runner/ort_test
 ```
 
 ```bash
-/root/flexi/chipyard/.conda-env/riscv-tools/bin/riscv64-unknown-linux-gnu-objdump \
+"${RISCV}/bin/riscv64-unknown-linux-gnu-objdump" \
   -d --demangle \
   --disassemble='(anonymous namespace)::gemmini_matmul_int32(signed char const*, signed char const*, int*, long, long, long, int) [clone .part.0]' \
   tvm-gemmini/3rdparty/gemmini/software/onnxruntime-riscv/systolic_runner/imagenet_runner/ort_test

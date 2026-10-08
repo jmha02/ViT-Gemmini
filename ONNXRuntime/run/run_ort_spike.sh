@@ -22,17 +22,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ONNXRT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 REPO_ROOT="$(cd "$ONNXRT_DIR/.." && pwd -P)"
-if [[ -n "${CHIPYARD_DIR:-}" && -d "${CHIPYARD_DIR}" ]]; then
-    FLEXI_DIR="$(cd "$(dirname "$CHIPYARD_DIR")" && pwd -P)"
-elif [[ -d "/root/flexi/chipyard" ]]; then
-    FLEXI_DIR="/root/flexi"
-else
-    FLEXI_DIR="$(cd "$REPO_ROOT/../.." && pwd -P)"
-fi
+source "${REPO_ROOT}/env.sh" >/dev/null
 
 ORT_RISCV_DIR="${ORT_RISCV_DIR:-${TVM_HOME:-${REPO_ROOT}/tvm-gemmini}/3rdparty/gemmini/software/onnxruntime-riscv}"
 ORT_TEST_BIN="${ORT_RISCV_DIR}/systolic_runner/imagenet_runner/ort_test"
-PK="${FLEXI_DIR}/chipyard/toolchains/riscv-tools/riscv-pk/build/pk"
+PK="${PK:-}"
+if [[ -z "${PK}" && -n "${CHIPYARD_DIR:-}" ]]; then
+    PK="${CHIPYARD_DIR}/toolchains/riscv-tools/riscv-pk/build/pk"
+fi
 
 IMAGE="${REPO_ROOT}/scripts/gemmini/test_cat.jpg"
 MODE="1"
@@ -114,12 +111,24 @@ SWIN_MODEL_FP32="${MODEL_DIR_LOCAL}/swin_tiny_fp32.onnx"
 SWIN_SMALL_MODEL_INT8="${MODEL_DIR_LOCAL}/swin_small_int8.onnx"
 
 resolve_spike() {
-    local preferred="${FLEXI_DIR}/chipyard/.conda-env/riscv-tools/bin/spike"
-    local legacy="${FLEXI_DIR}/chipyard/toolchains/riscv-tools/riscv-isa-sim/build/spike"
+    local preferred="${SPIKE_BIN:-}"
+    local riscv_spike="${RISCV:-}/bin/spike"
+    local chipyard_spike="${CHIPYARD_DIR:-}/.conda-env/riscv-tools/bin/spike"
+    local legacy="${CHIPYARD_DIR:-}/toolchains/riscv-tools/riscv-isa-sim/build/spike"
     local legacy_real=""
 
-    if [ -x "$preferred" ]; then
+    if [[ -n "$preferred" && -x "$preferred" ]]; then
         echo "$preferred"
+        return 0
+    fi
+
+    if [[ -x "$riscv_spike" ]]; then
+        echo "$riscv_spike"
+        return 0
+    fi
+
+    if [[ -x "$chipyard_spike" ]]; then
+        echo "$chipyard_spike"
         return 0
     fi
 
@@ -178,13 +187,14 @@ SPIKE="$(resolve_spike || true)"
 if [ -z "$SPIKE" ]; then
     echo "ERROR: spike binary not found."
     echo "  Tried:"
-    echo "    - ${FLEXI_DIR}/chipyard/.conda-env/riscv-tools/bin/spike"
-    echo "    - ${FLEXI_DIR}/chipyard/toolchains/riscv-tools/riscv-isa-sim/build/spike"
+    echo "    - ${SPIKE_BIN:-<set SPIKE_BIN>}"
+    echo "    - ${RISCV:-<set RISCV>}/bin/spike"
+    echo "    - ${CHIPYARD_DIR:-<set CHIPYARD_DIR>}/.conda-env/riscv-tools/bin/spike"
     exit 1
 fi
 
 if [ ! -x "$PK" ]; then
-    echo "ERROR: pk not found: $PK"
+    echo "ERROR: pk not found: ${PK:-<set PK or CHIPYARD_DIR>}"
     exit 1
 fi
 
@@ -198,7 +208,7 @@ fi
 if [ ! -f "$MODEL" ]; then
     echo "ERROR: ONNX model not found: $MODEL"
     echo "  Export first:"
-    echo "    ${REPO_ROOT}/ONNXRuntime/export/ivit/export_ivit_onnx.sh --checkpoint /root/checkpoint_last.pth.tar"
+    echo "    ${REPO_ROOT}/ONNXRuntime/export/ivit/export_onnx.sh --checkpoint <checkpoint>"
     exit 1
 fi
 

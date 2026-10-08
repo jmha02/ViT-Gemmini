@@ -1,4 +1,6 @@
 build/
+!/ONNXRuntime/build/
+!/ONNXRuntime/build/*.sh
 __pycache__/
 *.pyc
 *.pyo
@@ -10,3 +12,5 @@ __pycache__/
 *.tar
 *.pth
 *.pth.tar
+core
+core.*

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -82,12 +83,20 @@ def convert_state_dict(sd: dict, *, embed_dim: int, depth: int, num_heads: int) 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", type=Path, default=Path("/root/flexi/eval/data/ptq4_deit_t/e2e_model.pt"))
+    default_input = os.environ.get("PTQ4_DEIT_CHECKPOINT")
+    ap.add_argument(
+        "--input",
+        type=Path,
+        default=Path(default_input).expanduser() if default_input else None,
+    )
     ap.add_argument("--output", type=Path, default=REPO_ROOT / "build/checkpoints/ptq4_deit_tiny_fused_qkv.pt")
     ap.add_argument("--embed-dim", type=int, default=192)
     ap.add_argument("--depth", type=int, default=12)
     ap.add_argument("--num-heads", type=int, default=3)
     args = ap.parse_args()
+
+    if args.input is None or not args.input.is_file():
+        raise SystemExit("Pass --input or set PTQ4_DEIT_CHECKPOINT to an existing checkpoint.")
 
     blob = torch.load(str(args.input), map_location="cpu", weights_only=False)
     if isinstance(blob, dict) and "state_dict" in blob:

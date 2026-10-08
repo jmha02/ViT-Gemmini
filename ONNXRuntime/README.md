@@ -11,7 +11,7 @@ It is organized by workflow so the top level stays small:
 - `ort_ivit_ops/`: custom op sources for I-ViT and RepQ lowering
 
 If you want the shortest reproducible path for export -> Spike -> Verilator,
-start with [REPRO.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/REPRO.md).
+start with [REPRO.md](REPRO.md).
 
 Compatibility note:
 
@@ -22,7 +22,8 @@ Compatibility note:
 ### Build
 
 ```bash
-cd /root/flexi/third-party/I-ViT-Gemmini
+cd /path/to/flexi_baseline/ViT-Gemmini
+source ./env.sh
 ONNXRuntime/build/build_ort_riscv.sh
 ```
 
@@ -33,7 +34,7 @@ I-ViT exports:
 ```bash
 ONNXRuntime/export/ivit/export_onnx.sh \
   --model-name deit_tiny_patch16_224 \
-  --checkpoint /root/checkpoint_last.pth.tar \
+  --checkpoint "$IVIT_CHECKPOINT" \
   --output build/ort/ivit_tiny_int8.onnx
 ```
 
@@ -61,8 +62,8 @@ ONNXRuntime/export/repq/export_repq_onnx.sh \
   --verify-ort
 ```
 
-More export notes: [export/README.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/export/README.md)
-Minimal baseline flow: [REPRO.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/REPRO.md)
+More export notes: [export/README.md](export/README.md)
+Minimal baseline flow: [REPRO.md](REPRO.md)
 
 ### Run On Spike
 
@@ -90,7 +91,7 @@ ONNXRuntime/run/run_ort_spike.sh \
 - `1`: Gemmini output-stationary
 - `2`: Gemmini weight-stationary
 
-More run notes: [run/README.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/run/README.md)
+More run notes: [run/README.md](run/README.md)
 
 ### Run On Verilator
 
@@ -111,7 +112,7 @@ ONNXRuntime/run/run_ort_verilator_blocks.sh 0 11 1
 By default, the Verilator runner does not apply a host timeout or a simulator
 cycle cap. Set `TIMEOUT_SECS` and `MAX_CYCLES` only when you want limits.
 
-Detailed notes: [ORT_VERILATOR_PROFILING.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/profiling/ORT_VERILATOR_PROFILING.md)
+Detailed notes: [ORT_VERILATOR_PROFILING.md](profiling/ORT_VERILATOR_PROFILING.md)
 
 ## Validation Helpers
 
@@ -137,7 +138,7 @@ python3 ONNXRuntime/tools/run_reference_inference.py --help
 python3 ONNXRuntime/tools/run_repq_onnx_inference.py --help
 ```
 
-Tool index: [tools/README.md](/root/flexi/third-party/I-ViT-Gemmini/ONNXRuntime/tools/README.md)
+Tool index: [tools/README.md](tools/README.md)
 
 ## Custom Op Sources
 
