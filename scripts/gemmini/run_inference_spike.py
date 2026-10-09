@@ -5630,6 +5630,11 @@ def main():
     if not skip_common_load:
       if checkpoint_path is not None and checkpoint_path.exists():
         ckpt = torch.load(str(checkpoint_path), map_location="cpu")
+        if isinstance(ckpt, dict):
+          for state_key in ("model", "state_dict"):
+            if isinstance(ckpt.get(state_key), dict):
+              ckpt = ckpt[state_key]
+              break
         model_name = convert_model.resolve_model_name(ckpt, requested_model_name)
       else:
         if requested_model_name is None:
